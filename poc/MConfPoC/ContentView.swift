@@ -57,8 +57,8 @@ private func recoveredFileURL(for targetPath: String) -> URL {
     return docs.appendingPathComponent(filename)
 }
 
-private func recoveredDirectoryURL(for targetPath: String) -> URL {
-    docs.appendingPathComponent(outputFilename(for: targetPath) + ".directory.txt")
+private func recoveredZipURL(for targetPath: String) -> URL {
+    docs.appendingPathComponent(outputFilename(for: targetPath) + ".zip")
 }
 
 private struct ActivityView: UIViewControllerRepresentable {
@@ -121,14 +121,15 @@ struct ContentView: View {
                     let requestedPath = targetPath
                     let trimmedPath = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
                     let expectedResultURL = recoveredFileURL(for: trimmedPath)
-                    let expectedDirectoryURL = recoveredDirectoryURL(for: trimmedPath)
+                    let expectedZipURL = recoveredZipURL(for: trimmedPath)
+                    
                     DispatchQueue.global(qos: .userInitiated).async {
                         runChain(targetPath: requestedPath) { line in
                             DispatchQueue.main.async {
                                 logs.append(line)
-                                if line.hasPrefix("Saved directory listing "),
-                                   FileManager.default.fileExists(atPath: expectedDirectoryURL.path) {
-                                    resultURL = expectedDirectoryURL
+                                if line.hasPrefix("Saved "),
+                                   FileManager.default.fileExists(atPath: expectedZipURL.path) {
+                                    resultURL = expectedZipURL
                                 } else if line.hasPrefix("Saved "),
                                           FileManager.default.fileExists(atPath: expectedResultURL.path) {
                                     resultURL = expectedResultURL
@@ -450,7 +451,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         }
     }
 
-    /// Перечисляет папку и возвращает обычные файлы (с fallback через d_type на случай сбоя fstatat)
+    /// Перечисляет папку и возвращает обычные файлы
     func getFilesInDirectory(fd: Int32) -> [String] {
         guard let directory = fdopendir(fd) else {
             let savedErrno = errno
@@ -470,7 +471,6 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             if name == "." || name == ".." { continue }
 
             var isRegularFile = false
-
             var itemStat = stat()
             let statResult = name.withCString {
                 fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
@@ -481,7 +481,6 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     isRegularFile = true
                 }
             } else {
-                // Если fstatat не прошел, используем d_type из dirent (исключая папки DT_DIR)
                 let dType = entry.pointee.d_type
                 if dType == UInt8(DT_REG) {
                     isRegularFile = true
@@ -576,20 +575,68 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             if fstat(initialFd, &st) == 0 {
                 let fileType = st.st_mode & mode_t(S_IFMT)
                 if fileType == mode_t(S_IFDIR) {
-                    logLine("Target is a directory. Enumerating regular files...")
+                    logLine("Target is a directory.")
                     let fileNames = getFilesInDirectory(fd: initialFd)
-                    logLine("Found \(fileNames.count) regular file(s) inside directory.")
+                    close(initialFd)
 
+                    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                    do {
+                        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                    } catch {
+                        logLine("Failed to create temp directory: \(error.localizedDescription)")
+                        return
+                    }
+
+                    var totalBytesRead: Int64 = 0
                     let basePath = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
+
                     for name in fileNames {
                         let fullFilePath = basePath + name
-                        logLine("Reading file: \(name)")
                         if let fileFd = probe(fullFilePath) {
-                            saveFile(fd: fileFd, outputName: name)
-                        } else {
-                            logLine("Failed to open file: \(name)")
+                            var stFile = stat()
+                            if fstat(fileFd, &stFile) == 0 {
+                                let size = Int64(stFile.st_size)
+                                if size > 0 && size <= Int64(Int.max) {
+                                    var buffer = [UInt8](repeating: 0, count: Int(size))
+                                    let count = pread(fileFd, &buffer, buffer.count, 0)
+                                    if count > 0 {
+                                        let fileURL = tempDir.appendingPathComponent(name)
+                                        do {
+                                            try Data(buffer.prefix(count)).write(to: fileURL, options: .atomic)
+                                            totalBytesRead += Int64(count)
+                                        } catch {}
+                                    }
+                                }
+                            }
+                            close(fileFd)
                         }
                     }
+
+                    let zipFilename = outputName + ".zip"
+                    let destinationZipURL = docs.appendingPathComponent(zipFilename)
+                    try? FileManager.default.removeItem(at: destinationZipURL)
+
+                    let coordinator = NSFileCoordinator()
+                    var coordinationError: NSError?
+                    var successZip = false
+
+                    coordinator.coordinate(readingItemAt: tempDir, options: [.forUploading], error: &coordinationError) { zipURL in
+                        do {
+                            try FileManager.default.copyItem(at: zipURL, to: destinationZipURL)
+                            successZip = true
+                        } catch {
+                            logLine("Failed to copy zip: \(error.localizedDescription)")
+                        }
+                    }
+
+                    try? FileManager.default.removeItem(at: tempDir)
+
+                    if successZip {
+                        logLine("Saved \(totalBytesRead) bytes: \(zipFilename)")
+                    } else {
+                        logLine("Failed to create zip archive")
+                    }
+
                 } else if fileType == mode_t(S_IFREG) {
                     logLine("Target is a single file.")
                     saveFile(fd: initialFd, outputName: outputName)
