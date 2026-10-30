@@ -450,7 +450,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         }
     }
 
-    /// Перечисляет папку и возвращает ИСКЛЮЧИТЕЛЬНО обычные файлы (пропуская вложенные папки)
+    /// Перечисляет папку и возвращает обычные файлы (с fallback через d_type на случай сбоя fstatat)
     func getFilesInDirectory(fd: Int32) -> [String] {
         guard let directory = fdopendir(fd) else {
             let savedErrno = errno
@@ -469,15 +469,29 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             let name = directoryEntryName(entry)
             if name == "." || name == ".." { continue }
 
+            var isRegularFile = false
+
             var itemStat = stat()
             let statResult = name.withCString {
                 fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
             }
+            
             if statResult == 0 {
-                // Оставляем ТОЛЬКО обычные файлы (S_IFREG)
                 if (itemStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) {
-                    fileNames.append(name)
+                    isRegularFile = true
                 }
+            } else {
+                // Если fstatat не прошел, используем d_type из dirent (исключая папки DT_DIR)
+                let dType = entry.pointee.d_type
+                if dType == UInt8(DT_REG) {
+                    isRegularFile = true
+                } else if dType != UInt8(DT_DIR) && dType != 4 {
+                    isRegularFile = true
+                }
+            }
+
+            if isRegularFile {
+                fileNames.append(name)
             }
         }
 
