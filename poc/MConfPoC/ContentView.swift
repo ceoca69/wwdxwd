@@ -460,32 +460,26 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else {
-            logLine("fstat failed: errno=\(errno)")
             return
         }
 
         let size = Int64(st.st_size)
         guard size > 0 else {
-            logLine("File \(outputName) is empty (\(size) bytes)")
             return
         }
         guard size <= Int64(Int.max) else {
-            logLine("File \(outputName) is too large: \(size) bytes")
             return
         }
         var buffer = [UInt8](repeating: 0, count: Int(size))
         let count = pread(fd, &buffer, buffer.count, 0)
         guard count > 0 else {
-            logLine("Read failed for \(outputName): errno=\(errno)")
             return
         }
         let output = docs.appendingPathComponent(outputName)
         do {
             try Data(buffer.prefix(count)).write(to: output, options: .atomic)
             logLine("Saved \(count) bytes: \(outputName)")
-        } catch {
-            logLine("Save failed for \(outputName): \(error.localizedDescription)")
-        }
+        } catch {}
     }
 
     // Проба пути через 'Curl' daemon
@@ -544,7 +538,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
 
                     let stats = ProgressStats()
 
-                    // Рекурсивная функция обхода папок с инклюзивным захватом файлов и симлинков
+                    // Рекурсивная функция обхода папок с точным определением симлинков и файлов
                     func processDirectory(remotePath: String, localDestinationDir: URL) {
                         guard let dirFd = probe(remotePath) else { return }
                         defer { close(dirFd) }
@@ -563,6 +557,9 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                             var isDir = false
                             var isFile = false
                             
+                            let childRemotePath = (remotePath.hasSuffix("/") ? remotePath : remotePath + "/") + name
+                            let childLocalURL = localDestinationDir.appendingPathComponent(name)
+                            
                             var itemStat = stat()
                             let statResult = name.withCString {
                                 fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
@@ -572,21 +569,40 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                                 let mode = itemStat.st_mode & mode_t(S_IFMT)
                                 if mode == mode_t(S_IFDIR) {
                                     isDir = true
+                                } else if mode == mode_t(S_IFLNK) {
+                                    // Симлинк: проверяем, куда он ведет (на файл или директорию)
+                                    var targetStat = stat()
+                                    if stat(childRemotePath, &targetStat) == 0 {
+                                        if (targetStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) {
+                                            isDir = true
+                                        } else {
+                                            isFile = true
+                                        }
+                                    } else {
+                                        isFile = true
+                                    }
                                 } else {
-                                    // Всё остальное (regular files, symlinks, etc.) считаем файлами
                                     isFile = true
                                 }
                             } else {
                                 let dType = entry.pointee.d_type
                                 if dType == UInt8(DT_DIR) || dType == 4 {
                                     isDir = true
+                                } else if dType == UInt8(DT_LNK) || dType == 10 || dType == 0 {
+                                    var targetStat = stat()
+                                    if stat(childRemotePath, &targetStat) == 0 {
+                                        if (targetStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) {
+                                            isDir = true
+                                        } else {
+                                            isFile = true
+                                        }
+                                    } else {
+                                        isFile = true
+                                    }
                                 } else {
                                     isFile = true
                                 }
                             }
-                            
-                            let childRemotePath = (remotePath.hasSuffix("/") ? remotePath : remotePath + "/") + name
-                            let childLocalURL = localDestinationDir.appendingPathComponent(name)
                             
                             if isFile {
                                 if let fileFd = probe(childRemotePath) {
