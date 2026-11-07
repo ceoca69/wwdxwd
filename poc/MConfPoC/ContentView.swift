@@ -460,26 +460,32 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else {
+            logLine("fstat failed: errno=\(errno)")
             return
         }
 
         let size = Int64(st.st_size)
         guard size > 0 else {
+            logLine("File \(outputName) is empty (\(size) bytes)")
             return
         }
         guard size <= Int64(Int.max) else {
+            logLine("File \(outputName) is too large: \(size) bytes")
             return
         }
         var buffer = [UInt8](repeating: 0, count: Int(size))
         let count = pread(fd, &buffer, buffer.count, 0)
         guard count > 0 else {
+            logLine("Read failed for \(outputName): errno=\(errno)")
             return
         }
         let output = docs.appendingPathComponent(outputName)
         do {
             try Data(buffer.prefix(count)).write(to: output, options: .atomic)
             logLine("Saved \(count) bytes: \(outputName)")
-        } catch {}
+        } catch {
+            logLine("Save failed for \(outputName): \(error.localizedDescription)")
+        }
     }
 
     // Проба пути через 'Curl' daemon
@@ -538,7 +544,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
 
                     let stats = ProgressStats()
 
-                    // Рекурсивная функция обхода папок с точным определением симлинков и файлов
+                    // Рекурсивный обход любой глубины с поддержкой папок, бандлов и любых файлов
                     func processDirectory(remotePath: String, localDestinationDir: URL) {
                         guard let dirFd = probe(remotePath) else { return }
                         defer { close(dirFd) }
@@ -555,8 +561,6 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                             if name == "." || name == ".." { continue }
                             
                             var isDir = false
-                            var isFile = false
-                            
                             let childRemotePath = (remotePath.hasSuffix("/") ? remotePath : remotePath + "/") + name
                             let childLocalURL = localDestinationDir.appendingPathComponent(name)
                             
@@ -566,45 +570,26 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                             }
                             
                             if statResult == 0 {
-                                let mode = itemStat.st_mode & mode_t(S_IFMT)
-                                if mode == mode_t(S_IFDIR) {
+                                if (itemStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) {
                                     isDir = true
-                                } else if mode == mode_t(S_IFLNK) {
-                                    // Симлинк: проверяем, куда он ведет (на файл или директорию)
-                                    var targetStat = stat()
-                                    if stat(childRemotePath, &targetStat) == 0 {
-                                        if (targetStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) {
-                                            isDir = true
-                                        } else {
-                                            isFile = true
-                                        }
-                                    } else {
-                                        isFile = true
-                                    }
-                                } else {
-                                    isFile = true
                                 }
                             } else {
                                 let dType = entry.pointee.d_type
                                 if dType == UInt8(DT_DIR) || dType == 4 {
                                     isDir = true
-                                } else if dType == UInt8(DT_LNK) || dType == 10 || dType == 0 {
-                                    var targetStat = stat()
-                                    if stat(childRemotePath, &targetStat) == 0 {
-                                        if (targetStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) {
-                                            isDir = true
-                                        } else {
-                                            isFile = true
-                                        }
-                                    } else {
-                                        isFile = true
-                                    }
-                                } else {
-                                    isFile = true
                                 }
                             }
                             
-                            if isFile {
+                            if isDir {
+                                // Если директория — создаем подпапку локально и уходим рекурсивно глубже
+                                do {
+                                    try FileManager.default.createDirectory(at: childLocalURL, withIntermediateDirectories: true)
+                                } catch {
+                                    continue
+                                }
+                                processDirectory(remotePath: childRemotePath, localDestinationDir: childLocalURL)
+                            } else {
+                                // Если любой файл/симлинк — считываем через daemon
                                 if let fileFd = probe(childRemotePath) {
                                     var stFile = stat()
                                     if fstat(fileFd, &stFile) == 0 {
@@ -623,18 +608,11 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                                     }
                                     close(fileFd)
                                 }
-                            } else if isDir {
-                                do {
-                                    try FileManager.default.createDirectory(at: childLocalURL, withIntermediateDirectories: true)
-                                } catch {
-                                    continue
-                                }
-                                processDirectory(remotePath: childRemotePath, localDestinationDir: childLocalURL)
                             }
                         }
                     }
 
-                    // Запуск рекурсивного чтения
+                    // Запуск обхода выбранного пути
                     processDirectory(remotePath: targetPath, localDestinationDir: rootFolderURL)
 
                     let zipFilename = outputName + ".zip"
