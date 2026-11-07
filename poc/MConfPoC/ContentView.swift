@@ -1,4 +1,5 @@
 //
+
 //  ContentView.swift
 //  MConfPoC
 //
@@ -37,8 +38,27 @@ private final class EHBox {
 
 private final class ProgressStats {
     var totalBytes: Int64 = 0
-    var totalFiles: Int = 0
-    var failedFiles: Int = 0
+    var fileCount: Int = 0
+    var failedCount: Int = 0
+}
+
+private enum ScanMode {
+    case foldersV6
+    case filesV7
+
+    var title: String {
+        switch self {
+        case .foldersV6: return "Folders (v6)"
+        case .filesV7: return "Files (v7)"
+        }
+    }
+
+    var zipSuffix: String {
+        switch self {
+        case .foldersV6: return "_v6_folders"
+        case .filesV7: return "_v7_files"
+        }
+    }
 }
 
 private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
@@ -63,8 +83,8 @@ private func recoveredFileURL(for targetPath: String) -> URL {
     return docs.appendingPathComponent(filename)
 }
 
-private func recoveredZipURL(for targetPath: String) -> URL {
-    docs.appendingPathComponent(outputFilename(for: targetPath) + ".zip")
+private func recoveredZipURL(for targetPath: String, mode: ScanMode) -> URL {
+    docs.appendingPathComponent(outputFilename(for: targetPath) + mode.zipSuffix + ".zip")
 }
 
 private struct ActivityView: UIViewControllerRepresentable {
@@ -116,51 +136,45 @@ struct ContentView: View {
                         .overlay(panelShape.stroke(Color.white.opacity(0.07), lineWidth: 1))
                 }
 
-                Button {
-                    guard !isRunning else { return }
-                    isRunning = true
-                    status = "Running…"
-                    resultURL = nil
-                    if !logs.isEmpty {
-                        logs.append("──────── New run ────────")
-                    }
-                    let requestedPath = targetPath
-                    let trimmedPath = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let expectedResultURL = recoveredFileURL(for: trimmedPath)
-                    let expectedZipURL = recoveredZipURL(for: trimmedPath)
-                    
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        runChain(targetPath: requestedPath) { line in
-                            DispatchQueue.main.async {
-                                logs.append(line)
-                                if line.hasPrefix("Saved "),
-                                   FileManager.default.fileExists(atPath: expectedZipURL.path) {
-                                    resultURL = expectedZipURL
-                                } else if line.hasPrefix("Saved "),
-                                          FileManager.default.fileExists(atPath: expectedResultURL.path) {
-                                    resultURL = expectedResultURL
-                                }
-                            }
+                HStack(spacing: 10) {
+                    Button {
+                        startScan(mode: .foldersV6)
+                    } label: {
+                        VStack(spacing: 5) {
+                            Label("Folders", systemImage: "folder")
+                                .font(.system(size: 17, weight: .semibold))
+                            Text("Scanner v6")
+                                .font(.system(size: 12, weight: .medium))
                         }
-                        DispatchQueue.main.async {
-                            isRunning = false
-                            status = "Finished — see Documents/run.log"
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 66)
+                        .contentShape(panelShape)
+                    }
+                    .buttonStyle(.plain)
+                    .background(Color(uiColor: .systemIndigo), in: panelShape)
+                    .overlay(panelShape.stroke(Color.white.opacity(0.07), lineWidth: 1))
+                    .disabled(isRunning)
+
+                    Button {
+                        startScan(mode: .filesV7)
+                    } label: {
+                        VStack(spacing: 5) {
+                            Label("Files", systemImage: "doc.text")
+                                .font(.system(size: 17, weight: .semibold))
+                            Text("Scanner v7")
+                                .font(.system(size: 12, weight: .medium))
                         }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 66)
+                        .contentShape(panelShape)
                     }
-                } label: {
-                    ZStack {
-                        Text("Run")
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundStyle(.white)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 58)
-                    .contentShape(panelShape)
+                    .buttonStyle(.plain)
+                    .background(Color(uiColor: .systemBlue), in: panelShape)
+                    .overlay(panelShape.stroke(Color.white.opacity(0.07), lineWidth: 1))
+                    .disabled(isRunning)
                 }
-                .buttonStyle(.plain)
-                .background(Color(uiColor: .systemBlue), in: panelShape)
-                .overlay(panelShape.stroke(Color.white.opacity(0.07), lineWidth: 1))
-                .disabled(isRunning)
 
                 HStack {
                     Text("Run Log")
@@ -233,11 +247,46 @@ struct ContentView: View {
             }
         }
     }
+
+    private func startScan(mode: ScanMode) {
+        guard !isRunning else { return }
+
+        isRunning = true
+        status = "Running \(mode.title)…"
+        resultURL = nil
+        if !logs.isEmpty {
+            logs.append("──────── New run: \(mode.title) ────────")
+        }
+
+        let requestedPath = targetPath
+        let trimmedPath = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expectedResultURL = recoveredFileURL(for: trimmedPath)
+        let expectedZipURL = recoveredZipURL(for: trimmedPath, mode: mode)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            runChain(targetPath: requestedPath, mode: mode) { line in
+                DispatchQueue.main.async {
+                    logs.append(line)
+                    if line.hasPrefix("Saved "),
+                       FileManager.default.fileExists(atPath: expectedZipURL.path) {
+                        resultURL = expectedZipURL
+                    } else if line.hasPrefix("Saved "),
+                              FileManager.default.fileExists(atPath: expectedResultURL.path) {
+                        resultURL = expectedResultURL
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                isRunning = false
+                status = "Finished \(mode.title) — see Documents/run.log"
+            }
+        }
+    }
 }
 
 // MARK: - The chain
 
-private func runChain(targetPath requestedPath: String, onLog: @escaping (String) -> Void) {
+private func runChain(targetPath requestedPath: String, mode: ScanMode, onLog: @escaping (String) -> Void) {
     openLog()
     defer { if logFd >= 0 { close(logFd); logFd = -1 } }
     func logLine(_ message: String) {
@@ -246,6 +295,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         onLog(message)
     }
     logLine("Run started")
+    logLine("Scanner selected: \(mode.title)")
     let dev = UIDevice.current
     logLine("Device: \(dev.model), iOS \(dev.systemVersion)")
 
@@ -574,154 +624,6 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         return fd >= 0 ? fd : nil
     }
 
-    // Общий механизм считывания файла, используемый этапами V7 и V6.
-    func saveRemoteFile(
-        remotePath: String,
-        localURL: URL,
-        displayPath: String,
-        stats: ProgressStats
-    ) {
-        guard let fileFd = probe(remotePath) else {
-            stats.failedFiles += 1
-            logLine("File scan failed to open: \(displayPath)")
-            return
-        }
-        defer { close(fileFd) }
-
-        var stFile = stat()
-        guard fstat(fileFd, &stFile) == 0 else {
-            stats.failedFiles += 1
-            logLine("fstat failed for \(displayPath): errno=\(errno)")
-            return
-        }
-
-        let size = Int64(stFile.st_size)
-        guard size > 0 else {
-            logLine("Skipped empty file: \(displayPath) (\(size) bytes)")
-            return
-        }
-        guard size <= Int64(Int.max) else {
-            stats.failedFiles += 1
-            logLine("File is too large to read: \(displayPath) (\(size) bytes)")
-            return
-        }
-
-        var buffer = [UInt8](repeating: 0, count: Int(size))
-        let count = pread(fileFd, &buffer, buffer.count, 0)
-        guard count > 0 else {
-            stats.failedFiles += 1
-            logLine("Read failed for \(displayPath): errno=\(errno)")
-            return
-        }
-
-        do {
-            try FileManager.default.createDirectory(
-                at: localURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try Data(buffer.prefix(count)).write(to: localURL, options: .atomic)
-            stats.totalBytes += Int64(count)
-            stats.totalFiles += 1
-
-            if Int64(count) < size {
-                logLine("Saved \(count) of \(size) bytes (partial read): \(displayPath)")
-            } else {
-                logLine("Saved \(count) bytes: \(displayPath)")
-            }
-        } catch {
-            stats.failedFiles += 1
-            logLine("Save failed for \(displayPath): \(error.localizedDescription)")
-        }
-    }
-
-    // V6: рекурсивный обход. fdopendir() принимает владение dirFd,
-    // поэтому при успешном создании потока его закрывает только closedir().
-    func processDirectory(
-        remotePath: String,
-        localDestinationDir: URL,
-        skipFilesInCurrentDirectory: Bool,
-        stats: ProgressStats
-    ) {
-        guard let dirFd = probe(remotePath) else {
-            logLine("Folder scan failed to open directory: \(remotePath)")
-            return
-        }
-
-        guard let directory = fdopendir(dirFd) else {
-            let savedErrno = errno
-            close(dirFd)
-            logLine("Folder scan could not enumerate \(remotePath): errno=\(savedErrno)")
-            return
-        }
-        defer { closedir(directory) }
-
-        let directoryFD = dirfd(directory)
-
-        while true {
-            errno = 0
-            guard let entry = readdir(directory) else { break }
-
-            let name = directoryEntryName(entry)
-            if name == "." || name == ".." { continue }
-
-            var isDir = false
-            var isFile = false
-
-            var itemStat = stat()
-            let statResult = name.withCString {
-                fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
-            }
-
-            if statResult == 0 {
-                let mode = itemStat.st_mode & mode_t(S_IFMT)
-                if mode == mode_t(S_IFREG) {
-                    isFile = true
-                } else if mode == mode_t(S_IFDIR) {
-                    isDir = true
-                }
-            } else {
-                let dType = entry.pointee.d_type
-                if dType == UInt8(DT_REG) {
-                    isFile = true
-                } else if dType == UInt8(DT_DIR) || dType == 4 {
-                    isDir = true
-                }
-            }
-
-            let childRemotePath = (remotePath.hasSuffix("/") ? remotePath : remotePath + "/") + name
-            let childLocalURL = localDestinationDir.appendingPathComponent(name)
-
-            if isFile {
-                // Корневые файлы уже сохранены на первом этапе (V7).
-                if !skipFilesInCurrentDirectory {
-                    saveRemoteFile(
-                        remotePath: childRemotePath,
-                        localURL: childLocalURL,
-                        displayPath: childRemotePath,
-                        stats: stats
-                    )
-                }
-            } else if isDir {
-                do {
-                    try FileManager.default.createDirectory(
-                        at: childLocalURL,
-                        withIntermediateDirectories: true
-                    )
-                } catch {
-                    logLine("Could not create local folder for \(childRemotePath): \(error.localizedDescription)")
-                    continue
-                }
-
-                processDirectory(
-                    remotePath: childRemotePath,
-                    localDestinationDir: childLocalURL,
-                    skipFilesInCurrentDirectory: false,
-                    stats: stats
-                )
-            }
-        }
-    }
-
     if handshakeReady {
         logLine("Opening target path: \(targetPath)")
         if let initialFd = probe(targetPath) {
@@ -731,68 +633,200 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                 if fileType == mode_t(S_IFDIR) {
                     logLine("Target is a directory.")
 
-                    // V7: сначала перечисляем обычные файлы непосредственно в корне.
-                    // getFilesInDirectory передаёт fdopendir владение initialFd;
-                    // файловый дескриптор закрывается внутри closedir().
-                    let rootFileNames = getFilesInDirectory(fd: initialFd)
-
-                    let tempDir = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                    let rootFolderURL = tempDir.appendingPathComponent(outputName, isDirectory: true)
-
+                    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                     do {
-                        try FileManager.default.createDirectory(
-                            at: rootFolderURL,
-                            withIntermediateDirectories: true
-                        )
+                        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
                     } catch {
+                        close(initialFd)
                         logLine("Failed to create temp directory: \(error.localizedDescription)")
                         return
                     }
 
                     let stats = ProgressStats()
                     let basePath = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
-                    let zipFilename = outputName + ".zip"
-                    let destinationZipURL = docs.appendingPathComponent(zipFilename)
-                    // Удаляем результат предыдущего запуска до начала сканирования,
-                    // чтобы интерфейс не принял старый ZIP за результат текущего запуска.
-                    try? FileManager.default.removeItem(at: destinationZipURL)
 
-                    logLine("File scan (v7): found \(rootFileNames.count) files in the target directory.")
-                    for name in rootFileNames {
-                        saveRemoteFile(
-                            remotePath: basePath + name,
-                            localURL: rootFolderURL.appendingPathComponent(name),
-                            displayPath: outputName + "/" + name,
-                            stats: stats
-                        )
+                    switch mode {
+                    case .foldersV6:
+                        // V6: recursive directory traversal, preserving the folder tree.
+                        close(initialFd)
+                        logLine("Folder scan (v6): starting recursive directory traversal.")
+
+                        let rootFolderURL = tempDir.appendingPathComponent(outputName)
+                        do {
+                            try FileManager.default.createDirectory(at: rootFolderURL, withIntermediateDirectories: true)
+                        } catch {
+                            logLine("Failed to create root output folder: \(error.localizedDescription)")
+                            try? FileManager.default.removeItem(at: tempDir)
+                            return
+                        }
+
+                        func processDirectory(remotePath: String, localDestinationDir: URL) {
+                            guard let dirFd = probe(remotePath) else {
+                                logLine("Folder scan failed to open directory: \(remotePath)")
+                                stats.failedCount += 1
+                                return
+                            }
+
+                            // fdopendir takes ownership of dirFd; closedir below closes it.
+                            guard let directory = fdopendir(dirFd) else {
+                                let savedErrno = errno
+                                close(dirFd)
+                                logLine("Folder scan failed to read directory: \(remotePath), errno=\(savedErrno)")
+                                stats.failedCount += 1
+                                return
+                            }
+                            defer { closedir(directory) }
+
+                            let directoryFD = dirfd(directory)
+                            while true {
+                                errno = 0
+                                guard let entry = readdir(directory) else { break }
+                                let name = directoryEntryName(entry)
+                                if name == "." || name == ".." { continue }
+
+                                var isDir = false
+                                var isFile = false
+                                var itemStat = stat()
+                                let statResult = name.withCString {
+                                    fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
+                                }
+
+                                if statResult == 0 {
+                                    let itemType = itemStat.st_mode & mode_t(S_IFMT)
+                                    if itemType == mode_t(S_IFREG) {
+                                        isFile = true
+                                    } else if itemType == mode_t(S_IFDIR) {
+                                        isDir = true
+                                    }
+                                } else {
+                                    let dType = entry.pointee.d_type
+                                    if dType == UInt8(DT_REG) {
+                                        isFile = true
+                                    } else if dType == UInt8(DT_DIR) || dType == 4 {
+                                        isDir = true
+                                    }
+                                }
+
+                                let childRemotePath = (remotePath.hasSuffix("/") ? remotePath : remotePath + "/") + name
+                                let childLocalURL = localDestinationDir.appendingPathComponent(name)
+
+                                if isFile {
+                                    guard let fileFd = probe(childRemotePath) else {
+                                        logLine("Folder scan failed to open file: \(childRemotePath)")
+                                        stats.failedCount += 1
+                                        continue
+                                    }
+
+                                    var stFile = stat()
+                                    if fstat(fileFd, &stFile) != 0 {
+                                        logLine("Folder scan fstat failed: \(childRemotePath), errno=\(errno)")
+                                        stats.failedCount += 1
+                                        close(fileFd)
+                                        continue
+                                    }
+
+                                    let size = Int64(stFile.st_size)
+                                    if size <= 0 || size > Int64(Int.max) {
+                                        logLine("Folder scan skipped empty/oversized file: \(childRemotePath) (\(size) bytes)")
+                                        stats.failedCount += 1
+                                        close(fileFd)
+                                        continue
+                                    }
+
+                                    var buffer = [UInt8](repeating: 0, count: Int(size))
+                                    let count = pread(fileFd, &buffer, buffer.count, 0)
+                                    close(fileFd)
+
+                                    if count > 0 {
+                                        do {
+                                            try FileManager.default.createDirectory(at: localDestinationDir, withIntermediateDirectories: true)
+                                            try Data(buffer.prefix(count)).write(to: childLocalURL, options: .atomic)
+                                            stats.totalBytes += Int64(count)
+                                            stats.fileCount += 1
+                                        } catch {
+                                            logLine("Folder scan save failed: \(childRemotePath): \(error.localizedDescription)")
+                                            stats.failedCount += 1
+                                        }
+                                    } else {
+                                        logLine("Folder scan read failed: \(childRemotePath), errno=\(errno)")
+                                        stats.failedCount += 1
+                                    }
+                                } else if isDir {
+                                    do {
+                                        try FileManager.default.createDirectory(at: childLocalURL, withIntermediateDirectories: true)
+                                    } catch {
+                                        logLine("Folder scan could not create local folder: \(childLocalURL.path)")
+                                        stats.failedCount += 1
+                                        continue
+                                    }
+                                    processDirectory(remotePath: childRemotePath, localDestinationDir: childLocalURL)
+                                }
+                            }
+                        }
+
+                        processDirectory(remotePath: targetPath, localDestinationDir: rootFolderURL)
+                        logLine("Folder scan (v6) complete: \(stats.fileCount) files, \(stats.totalBytes) bytes, \(stats.failedCount) failures.")
+
+                    case .filesV7:
+                        // V7: only regular files directly inside the selected directory (no recursion).
+                        logLine("File scan (v7): scanning files directly inside the directory.")
+                        let fileNames = getFilesInDirectory(fd: initialFd) // fdopendir/closedir owns and closes initialFd.
+
+                        for name in fileNames {
+                            let fullFilePath = basePath + name
+                            guard let fileFd = probe(fullFilePath) else {
+                                logLine("File scan (v7) failed to open: \(fullFilePath)")
+                                stats.failedCount += 1
+                                continue
+                            }
+
+                            var stFile = stat()
+                            if fstat(fileFd, &stFile) != 0 {
+                                logLine("File scan (v7) fstat failed: \(fullFilePath), errno=\(errno)")
+                                stats.failedCount += 1
+                                close(fileFd)
+                                continue
+                            }
+
+                            let size = Int64(stFile.st_size)
+                            if size <= 0 || size > Int64(Int.max) {
+                                logLine("File scan (v7) skipped empty/oversized file: \(fullFilePath) (\(size) bytes)")
+                                stats.failedCount += 1
+                                close(fileFd)
+                                continue
+                            }
+
+                            var buffer = [UInt8](repeating: 0, count: Int(size))
+                            let count = pread(fileFd, &buffer, buffer.count, 0)
+                            close(fileFd)
+
+                            if count > 0 {
+                                let fileURL = tempDir.appendingPathComponent(name)
+                                do {
+                                    try Data(buffer.prefix(count)).write(to: fileURL, options: .atomic)
+                                    stats.totalBytes += Int64(count)
+                                    stats.fileCount += 1
+                                } catch {
+                                    logLine("File scan (v7) save failed: \(fullFilePath): \(error.localizedDescription)")
+                                    stats.failedCount += 1
+                                }
+                            } else {
+                                logLine("File scan (v7) read failed: \(fullFilePath), errno=\(errno)")
+                                stats.failedCount += 1
+                            }
+                        }
+                        logLine("File scan (v7) complete: \(stats.fileCount) files, \(stats.totalBytes) bytes, \(stats.failedCount) failures.")
                     }
-                    logLine("File scan (v7) complete: \(stats.totalFiles) files, \(stats.totalBytes) bytes.")
 
-                    // V6: затем сканируем вложенные папки рекурсивно.
-                    // Файлы корневой директории пропускаются, поскольку их уже обработал V7.
-                    logLine("Folder scan (v6): starting recursive directory traversal.")
-                    let filesBeforeFolderScan = stats.totalFiles
-                    let bytesBeforeFolderScan = stats.totalBytes
-                    processDirectory(
-                        remotePath: targetPath,
-                        localDestinationDir: rootFolderURL,
-                        skipFilesInCurrentDirectory: true,
-                        stats: stats
-                    )
-                    let folderFiles = stats.totalFiles - filesBeforeFolderScan
-                    let folderBytes = stats.totalBytes - bytesBeforeFolderScan
-                    logLine("Folder scan (v6) complete: \(folderFiles) files, \(folderBytes) bytes.")
+                    // Distinct archive names: running one scanner never overwrites the other result.
+                    let zipFilename = outputName + mode.zipSuffix + ".zip"
+                    let destinationZipURL = docs.appendingPathComponent(zipFilename)
+                    try? FileManager.default.removeItem(at: destinationZipURL)
 
                     let coordinator = NSFileCoordinator()
                     var coordinationError: NSError?
                     var successZip = false
-
-                    coordinator.coordinate(
-                        readingItemAt: tempDir,
-                        options: [.forUploading],
-                        error: &coordinationError
-                    ) { zipURL in
+                    coordinator.coordinate(readingItemAt: tempDir, options: [.forUploading], error: &coordinationError) { zipURL in
                         do {
                             try FileManager.default.copyItem(at: zipURL, to: destinationZipURL)
                             successZip = true
@@ -801,16 +835,15 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                         }
                     }
 
+                    if let coordinationError = coordinationError {
+                        logLine("ZIP coordination failed: \(coordinationError.localizedDescription)")
+                    }
                     try? FileManager.default.removeItem(at: tempDir)
 
                     if successZip {
-                        logLine("Saved \(stats.totalBytes) bytes in \(stats.totalFiles) files: \(zipFilename)")
-                        if stats.failedFiles > 0 {
-                            logLine("Warning: \(stats.failedFiles) files could not be saved.")
-                        }
+                        logLine("Saved \(stats.totalBytes) bytes in \(stats.fileCount) files: \(zipFilename)")
                     } else {
-                        let detail = coordinationError?.localizedDescription ?? "unknown coordination error"
-                        logLine("Failed to create zip archive: \(detail)")
+                        logLine("Failed to create zip archive")
                     }
 
                 } else if fileType == mode_t(S_IFREG) {
