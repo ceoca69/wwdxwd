@@ -455,18 +455,18 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         }
     }
 
-    // Структура для разделения содержимого директории на файлы и подпапки
-    struct DirContents {
+    // Раздельное определение файлов и папок внутри директории
+    struct DirectoryContents {
         var files: [String] = []
-        var subdirs: [String] = []
+        var subdirectories: [String] = []
     }
 
-    func inspectDirectory(fd: Int32) -> DirContents {
-        guard let directory = fdopendir(fd) else { return DirContents() }
+    func inspectDirectory(fd: Int32) -> DirectoryContents {
+        guard let directory = fdopendir(fd) else { return DirectoryContents() }
         defer { closedir(directory) }
 
         let directoryFD = dirfd(directory)
-        var contents = DirContents()
+        var contents = DirectoryContents()
 
         while true {
             errno = 0
@@ -474,7 +474,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             let name = directoryEntryName(entry)
             if name == "." || name == ".." { continue }
 
-            var isDir = false
+            var isDirectory = false
             var isFile = false
 
             var itemStat = stat()
@@ -485,28 +485,28 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             if statResult == 0 {
                 let mode = itemStat.st_mode & mode_t(S_IFMT)
                 if mode == mode_t(S_IFDIR) {
-                    isDir = true
+                    isDirectory = true
                 } else {
                     isFile = true
                 }
             } else {
                 let dType = entry.pointee.d_type
                 if dType == UInt8(DT_DIR) || dType == 4 {
-                    isDir = true
+                    isDirectory = true
                 } else {
                     isFile = true
                 }
             }
 
-            if isDir {
-                contents.subdirs.append(name)
+            if isDirectory {
+                contents.subdirectories.append(name)
             } else if isFile {
                 contents.files.append(name)
             }
         }
 
         contents.files.sort { $0.localizedStandardCompare($1) == .orderedAscending }
-        contents.subdirs.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        contents.subdirectories.sort { $0.localizedStandardCompare($1) == .orderedAscending }
         return contents
     }
 
@@ -600,12 +600,12 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     let stats = ProgressStats()
                     let basePath = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
 
-                    // Получаем содержимое верхнего уровня
+                    // Получаем раздельное содержимое верхнего уровня
                     let topContents = inspectDirectory(fd: initialFd)
                     close(initialFd)
 
                     // -------------------------------------------------------------
-                    // ЭТАП 1: Читаем ТОЛЬКО файлы верхнего уровня (диры отложены на потом)
+                    // ЭТАП 1: Сначала читаем ТОЛЬКО файлы верхнего уровня
                     // -------------------------------------------------------------
                     for name in topContents.files {
                         let fullFilePath = basePath + name
@@ -630,7 +630,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     }
 
                     // -------------------------------------------------------------
-                    // ЭТАП 2: Рекурсивный обход подпапок (сначала файлы внутри них, потом вложенные диры)
+                    // ЭТАП 2: Затем обрабатываем обнаруженные папки (сначала файлы внутри них, потом вложенные папки)
                     // -------------------------------------------------------------
                     func processDirectoryRecursive(remoteDirPath: String, localTargetURL: URL) {
                         guard let dirFd = probe(remoteDirPath) else { return }
@@ -639,7 +639,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
 
                         let subBasePath = remoteDirPath.hasSuffix("/") ? remoteDirPath : remoteDirPath + "/"
 
-                        // 2.1 Сначала читаем файлы в этой подпапке
+                        // 2.1 Читаем файлы внутри этой подпапки
                         for fileName in contents.files {
                             let fileRemotePath = subBasePath + fileName
                             if let fileFd = probe(fileRemotePath) {
@@ -663,8 +663,8 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                             }
                         }
 
-                        // 2.2 Затем переходим к вложенным подпапкам
-                        for dirName in contents.subdirs {
+                        // 2.2 Рекурсивно переходим к вложенным подпапкам
+                        for dirName in contents.subdirectories {
                             let childRemotePath = subBasePath + dirName
                             let childLocalURL = localTargetURL.appendingPathComponent(dirName)
                             do {
@@ -676,8 +676,8 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                         }
                     }
 
-                    // Запускаем обход для каждой папки верхнего уровня
-                    for dirName in topContents.subdirs {
+                    // Запуск обработки для каждой папки верхнего уровня
+                    for dirName in topContents.subdirectories {
                         let subDirPath = basePath + dirName
                         let localSubDirURL = rootFolderURL.appendingPathComponent(dirName)
                         do {
@@ -689,7 +689,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     }
 
                     // -------------------------------------------------------------
-                    // Финал: Упаковка всего в ZIP и подготовка экспорта
+                    // ФИНАЛ: Упаковка всего в один ZIP-архив
                     // -------------------------------------------------------------
                     let zipFilename = outputName + ".zip"
                     let destinationZipURL = docs.appendingPathComponent(zipFilename)
