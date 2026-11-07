@@ -35,6 +35,10 @@ private final class EHBox {
     var seen = false
 }
 
+private final class ProgressStats {
+    var totalBytes: Int64 = 0
+}
+
 private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
     guard let pointer else { return }
     Unmanaged<CFTypeRef>.fromOpaque(pointer).release()
@@ -451,63 +455,18 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
         }
     }
 
-    /// Перечисляет папку и возвращает обычные файлы
-    func getFilesInDirectory(fd: Int32) -> [String] {
-        guard let directory = fdopendir(fd) else {
-            let savedErrno = errno
-            close(fd)
-            logLine("Directory stream creation failed: errno=\(savedErrno)")
-            return []
-        }
-        defer { closedir(directory) }
-
-        let directoryFD = dirfd(directory)
-        var fileNames: [String] = []
-
-        while true {
-            errno = 0
-            guard let entry = readdir(directory) else { break }
-            let name = directoryEntryName(entry)
-            if name == "." || name == ".." { continue }
-
-            var isRegularFile = false
-            var itemStat = stat()
-            let statResult = name.withCString {
-                fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
-            }
-            
-            if statResult == 0 {
-                if (itemStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) {
-                    isRegularFile = true
-                }
-            } else {
-                let dType = entry.pointee.d_type
-                if dType == UInt8(DT_REG) {
-                    isRegularFile = true
-                } else if dType != UInt8(DT_DIR) && dType != 4 {
-                    isRegularFile = true
-                }
-            }
-
-            if isRegularFile {
-                fileNames.append(name)
-            }
-        }
-
-        fileNames.sort { $0.localizedStandardCompare($1) == .orderedAscending }
-        return fileNames
+    // Структура для разделения содержимого директории на файлы и подпапки
+    struct DirContents {
+        var files: [String] = []
+        var subdirs: [String] = []
     }
 
-    /// Перечисляет папку и возвращает список подпапок (директорий)
-    func getSubdirectoriesInDirectory(fd: Int32) -> [String] {
-        guard let directory = fdopendir(fd) else {
-            close(fd)
-            return []
-        }
+    func inspectDirectory(fd: Int32) -> DirContents {
+        guard let directory = fdopendir(fd) else { return DirContents() }
         defer { closedir(directory) }
 
         let directoryFD = dirfd(directory)
-        var dirNames: [String] = []
+        var contents = DirContents()
 
         while true {
             errno = 0
@@ -515,30 +474,40 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
             let name = directoryEntryName(entry)
             if name == "." || name == ".." { continue }
 
-            var isDirectory = false
+            var isDir = false
+            var isFile = false
+
             var itemStat = stat()
             let statResult = name.withCString {
                 fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
             }
             
             if statResult == 0 {
-                if (itemStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) {
-                    isDirectory = true
+                let mode = itemStat.st_mode & mode_t(S_IFMT)
+                if mode == mode_t(S_IFDIR) {
+                    isDir = true
+                } else {
+                    isFile = true
                 }
             } else {
                 let dType = entry.pointee.d_type
                 if dType == UInt8(DT_DIR) || dType == 4 {
-                    isDirectory = true
+                    isDir = true
+                } else {
+                    isFile = true
                 }
             }
 
-            if isDirectory {
-                dirNames.append(name)
+            if isDir {
+                contents.subdirs.append(name)
+            } else if isFile {
+                contents.files.append(name)
             }
         }
 
-        dirNames.sort { $0.localizedStandardCompare($1) == .orderedAscending }
-        return dirNames
+        contents.files.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        contents.subdirs.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        return contents
     }
 
     // Сохраняет одиночный файл
@@ -628,15 +597,17 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                         return
                     }
 
-                    var totalBytesRead: Int64 = 0
+                    let stats = ProgressStats()
                     let basePath = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
 
-                    // -------------------------------------------------------------
-                    // ЭТАП 1: Сначала читаем ТОЛЬКО файлы целевой папки
-                    // -------------------------------------------------------------
-                    let fileNames = getFilesInDirectory(fd: initialFd)
+                    // Получаем содержимое верхнего уровня
+                    let topContents = inspectDirectory(fd: initialFd)
+                    close(initialFd)
 
-                    for name in fileNames {
+                    // -------------------------------------------------------------
+                    // ЭТАП 1: Читаем ТОЛЬКО файлы верхнего уровня (диры отложены на потом)
+                    // -------------------------------------------------------------
+                    for name in topContents.files {
                         let fullFilePath = basePath + name
                         if let fileFd = probe(fullFilePath) {
                             var stFile = stat()
@@ -649,7 +620,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                                         let destinationFileURL = rootFolderURL.appendingPathComponent(name)
                                         do {
                                             try Data(buffer.prefix(count)).write(to: destinationFileURL, options: .atomic)
-                                            totalBytesRead += Int64(count)
+                                            stats.totalBytes += Int64(count)
                                         } catch {}
                                     }
                                 }
@@ -659,62 +630,66 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     }
 
                     // -------------------------------------------------------------
-                    // ЭТАП 2: Теперь читаем подпапки (директории) внутри этой папки
+                    // ЭТАП 2: Рекурсивный обход подпапок (сначала файлы внутри них, потом вложенные диры)
                     // -------------------------------------------------------------
-                    func readDirectoryRecursive(remoteDirPath: String, localTargetURL: URL) {
+                    func processDirectoryRecursive(remoteDirPath: String, localTargetURL: URL) {
                         guard let dirFd = probe(remoteDirPath) else { return }
-                        
-                        let subFiles = getFilesInDirectory(fd: dirFd)
-                        for fName in subFiles {
-                            let childFilePath = (remoteDirPath.hasSuffix("/") ? remoteDirPath : remoteDirPath + "/") + fName
-                            if let fFd = probe(childFilePath) {
+                        let contents = inspectDirectory(fd: dirFd)
+                        close(dirFd)
+
+                        let subBasePath = remoteDirPath.hasSuffix("/") ? remoteDirPath : remoteDirPath + "/"
+
+                        // 2.1 Сначала читаем файлы в этой подпапке
+                        for fileName in contents.files {
+                            let fileRemotePath = subBasePath + fileName
+                            if let fileFd = probe(fileRemotePath) {
                                 var stFile = stat()
-                                if fstat(fFd, &stFile) == 0 {
+                                if fstat(fileFd, &stFile) == 0 {
                                     let size = Int64(stFile.st_size)
                                     if size > 0 && size <= Int64(Int.max) {
                                         var buffer = [UInt8](repeating: 0, count: Int(size))
-                                        let count = pread(fFd, &buffer, buffer.count, 0)
+                                        let count = pread(fileFd, &buffer, buffer.count, 0)
                                         if count > 0 {
-                                            let destURL = localTargetURL.appendingPathComponent(fName)
+                                            let destFileURL = localTargetURL.appendingPathComponent(fileName)
                                             do {
-                                                try Data(buffer.prefix(count)).write(to: destURL, options: .atomic)
-                                                totalBytesRead += Int64(count)
+                                                try FileManager.default.createDirectory(at: localTargetURL, withIntermediateDirectories: true)
+                                                try Data(buffer.prefix(count)).write(to: destFileURL, options: .atomic)
+                                                stats.totalBytes += Int64(count)
                                             } catch {}
                                         }
                                     }
                                 }
-                                close(fFd)
+                                close(fileFd)
                             }
                         }
 
-                        if let dirFdForSubs = probe(remoteDirPath) {
-                            let subDirs = getSubdirectoriesInDirectory(fd: dirFdForSubs)
-                            for dName in subDirs {
-                                let childDirPath = (remoteDirPath.hasSuffix("/") ? remoteDirPath : remoteDirPath + "/") + dName
-                                let childLocalDir = localTargetURL.appendingPathComponent(dName)
-                                do {
-                                    try FileManager.default.createDirectory(at: childLocalDir, withIntermediateDirectories: true)
-                                } catch {}
-                                readDirectoryRecursive(remoteDirPath: childDirPath, localTargetURL: childLocalDir)
+                        // 2.2 Затем переходим к вложенным подпапкам
+                        for dirName in contents.subdirs {
+                            let childRemotePath = subBasePath + dirName
+                            let childLocalURL = localTargetURL.appendingPathComponent(dirName)
+                            do {
+                                try FileManager.default.createDirectory(at: childLocalURL, withIntermediateDirectories: true)
+                            } catch {
+                                continue
                             }
+                            processDirectoryRecursive(remoteDirPath: childRemotePath, localTargetURL: childLocalURL)
                         }
                     }
 
-                    if let secondPassFd = probe(targetPath) {
-                        let subDirectories = getSubdirectoriesInDirectory(fd: secondPassFd)
-                        for dirName in subDirectories {
-                            let subDirPath = basePath + dirName
-                            let localSubDirURL = rootFolderURL.appendingPathComponent(dirName)
-                            do {
-                                try FileManager.default.createDirectory(at: localSubDirURL, withIntermediateDirectories: true)
-                            } catch {}
-                            
-                            readDirectoryRecursive(remoteDirPath: subDirPath, localTargetURL: localSubDirURL)
+                    // Запускаем обход для каждой папки верхнего уровня
+                    for dirName in topContents.subdirs {
+                        let subDirPath = basePath + dirName
+                        let localSubDirURL = rootFolderURL.appendingPathComponent(dirName)
+                        do {
+                            try FileManager.default.createDirectory(at: localSubDirURL, withIntermediateDirectories: true)
+                        } catch {
+                            continue
                         }
+                        processDirectoryRecursive(remoteDirPath: subDirPath, localTargetURL: localSubDirURL)
                     }
 
                     // -------------------------------------------------------------
-                    // Упаковка в 1 ZIP-архив и сохранение
+                    // Финал: Упаковка всего в ZIP и подготовка экспорта
                     // -------------------------------------------------------------
                     let zipFilename = outputName + ".zip"
                     let destinationZipURL = docs.appendingPathComponent(zipFilename)
@@ -736,7 +711,7 @@ private func runChain(targetPath requestedPath: String, onLog: @escaping (String
                     try? FileManager.default.removeItem(at: tempDir)
 
                     if successZip {
-                        logLine("Saved \(totalBytesRead) bytes: \(zipFilename)")
+                        logLine("Saved \(stats.totalBytes) bytes: \(zipFilename)")
                     } else {
                         logLine("Failed to create zip archive")
                     }
